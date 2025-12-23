@@ -1,0 +1,5 @@
+{
+  "name": "RDF Graph Navigator",
+  "description": "A powerful RDF and JSON-LD graph visualization tool with interactive physics, neighbor highlighting, and AI-assisted relationship analysis.",
+  "requestFramePermissions": []
+}
