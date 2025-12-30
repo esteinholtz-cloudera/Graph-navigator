@@ -5,6 +5,11 @@ export const parseInputToGraph = (input: string, format: 'rdf' | 'json'): GraphD
   const nodesMap = new Map<string, GraphNode>();
   const links: GraphLink[] = [];
   const extraAttributes = new Set<string>();
+  let parseError: string | undefined;
+
+  if (!input.trim()) {
+    return { nodes: [], links: [], extraAttributes: [] };
+  }
 
   const structuralKeys = [
     '@id', 'id', 'subject', 's',
@@ -13,10 +18,20 @@ export const parseInputToGraph = (input: string, format: 'rdf' | 'json'): GraphD
     '@type', 'type', 'label', 'name'
   ];
 
+  /**
+   * Extracts a short label from a URI or prefixed name.
+   */
+  const getShortLabel = (id: string): string => {
+    if (id === 'a') return 'type';
+    const parts = id.split(/[\/#:]/);
+    const last = parts.pop();
+    return last || id;
+  };
+
   const addNode = (id: string, label?: string, metadata?: Record<string, any>) => {
+    if (!id) return;
     const existing = nodesMap.get(id);
-    // Use : as well as / and # to extract the local name for the label
-    const defaultLabel = id.split(/[\/#:]/).pop() || id;
+    const defaultLabel = getShortLabel(id);
     
     const newNode: GraphNode = {
       id,
@@ -35,137 +50,187 @@ export const parseInputToGraph = (input: string, format: 'rdf' | 'json'): GraphD
     }
   };
 
+  const isXml = input.trim().startsWith('<?xml') || input.trim().startsWith('<rdf:RDF');
+
   if (format === 'json') {
     try {
       const data = JSON.parse(input);
       const items = Array.isArray(data) ? data : [data];
       
       items.forEach((item: any) => {
-        const s = item.subject || item.s || item['@id'] || item['id'];
-        const p = item.predicate || item.p || item.predicate_id;
-        const o = item.object || item.o || item.target;
+        let s, p, o, metadata: Record<string, any> = {};
 
-        if (s && p && o) {
-          const metadata: Record<string, any> = {};
+        if (Array.isArray(item) && item.length >= 3) {
+          s = item[0]; p = item[1]; o = item[2];
+        } else if (typeof item === 'object') {
+          s = item.subject || item.s || item['@id'] || item['id'];
+          p = item.predicate || item.p || item.predicate_id;
+          o = item.object || item.o || item.target;
+
           Object.entries(item).forEach(([key, value]) => {
             if (!structuralKeys.includes(key)) {
               metadata[key] = value;
               extraAttributes.add(key);
             }
           });
-          
+        }
+
+        if (s && p && o) {
           addNode(String(s), undefined, metadata);
           addNode(String(o), undefined, metadata);
-          
           links.push({
             source: String(s),
             target: String(o),
-            label: String(p).split(/[\/#:]/).pop() || String(p),
+            label: getShortLabel(String(p)),
             uri: String(p),
             metadata: metadata
           });
-        } else {
-          const subjectId = item['@id'] || item['id'] || 'unknown';
-          const itemMetadata: Record<string, any> = {};
-          
-          Object.entries(item).forEach(([key, value]) => {
-            if (!structuralKeys.includes(key)) {
-              itemMetadata[key] = value;
-            }
-          });
-
-          addNode(subjectId, item['label'] || item['name'], itemMetadata);
-
-          Object.entries(item).forEach(([predicate, value]) => {
-            if (structuralKeys.includes(predicate)) return;
-
-            const values = Array.isArray(value) ? value : [value];
-            values.forEach((v: any) => {
-              let targetId = '';
-              let targetLabel = '';
-              let targetMetadata: Record<string, any> = {};
-
-              if (typeof v === 'string') {
-                targetId = v;
-              } else if (v && typeof v === 'object') {
-                targetId = v['@id'] || v['id'] || JSON.stringify(v);
-                targetLabel = v['label'] || v['name'] || '';
-                Object.keys(v).forEach(k => {
-                  if (!structuralKeys.includes(k)) {
-                    targetMetadata[k] = v[k];
-                    extraAttributes.add(k);
-                  }
-                });
-              }
-
-              if (targetId) {
-                addNode(targetId, targetLabel, targetMetadata);
-                links.push({
-                  source: subjectId,
-                  target: targetId,
-                  label: predicate.split(/[\/#:]/).pop() || predicate,
-                  uri: predicate
-                });
-              }
-            });
-          });
         }
       });
-    } catch (e) {
-      console.error('JSON Parse error', e);
+    } catch (e: any) {
+      parseError = `JSON Syntax Error: ${e.message}`;
+    }
+  } else if (isXml) {
+    try {
+      // Manual entity resolution for DTDs since standard DOMParser ignores them
+      let resolvedInput = input;
+      const entityRegex = /<!ENTITY\s+(\w+)\s+['"]([^'"]+)['"]\s*>/g;
+      const entities: Record<string, string> = {};
+      let match;
+      while ((match = entityRegex.exec(input)) !== null) {
+        entities[match[1]] = match[2];
+      }
+      
+      // Replace entities like &wn20instances; with their values
+      Object.entries(entities).forEach(([name, value]) => {
+        const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const r = new RegExp(`&${escapedName};`, 'g');
+        resolvedInput = resolvedInput.replace(r, value);
+      });
+
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(resolvedInput, "text/xml");
+      const errorNode = doc.querySelector("parsererror");
+      if (errorNode) throw new Error(errorNode.textContent || "XML Parsing Error");
+
+      const descriptions = doc.getElementsByTagNameNS("*", "Description");
+      let matchedTriples = 0;
+
+      for (let i = 0; i < descriptions.length; i++) {
+        const desc = descriptions[i];
+        const subject = desc.getAttributeNS("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "about") || 
+                        desc.getAttribute("rdf:about") ||
+                        desc.getAttributeNS("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "ID") ||
+                        desc.getAttribute("rdf:ID");
+        
+        if (!subject) continue;
+
+        const children = desc.children;
+        for (let j = 0; j < children.length; j++) {
+          const predNode = children[j];
+          const predicate = predNode.tagName;
+          const object = predNode.getAttributeNS("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "resource") ||
+                         predNode.getAttribute("rdf:resource") ||
+                         predNode.textContent?.trim();
+
+          if (predicate && object) {
+            matchedTriples++;
+            addNode(subject);
+            addNode(object);
+            links.push({
+              source: subject,
+              target: object,
+              label: getShortLabel(predicate),
+              uri: predicate
+            });
+          }
+        }
+      }
+
+      if (matchedTriples === 0) {
+        parseError = "XML parsed but no rdf:Description triples were found.";
+      }
+    } catch (e: any) {
+      parseError = `RDF/XML Error: ${e.message}`;
     }
   } else {
+    // NTriples / Turtle fallback
     const lines = input.split('\n');
-    lines.forEach(line => {
-      const match = line.match(/^\s*(<[^>]+>|[\w-]+:[\w-]+)\s+(<[^>]+>|[\w-]+:[\w-]+)\s+(<[^>]+>|[\w-]+:[\w-]+|".*?")\s*\.?/);
-      if (match) {
-        const [_, s, p, o] = match;
-        const subjId = s.replace(/[<>]/g, '');
-        const predId = p.replace(/[<>]/g, '');
-        const objId = o.replace(/[<>]/g, '').replace(/"/g, '');
+    let matchedLines = 0;
+    const tripleRegex = /^\s*(<[^>]+>|[^\s<>]+)\s+(<[^>]+>|[^\s<>]+)\s+(<[^>]+>|".*?"|[^\s<>]+?)(?:\s*\.|\s*$)/;
 
-        addNode(subjId);
-        addNode(objId);
+    lines.forEach((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('@prefix') || trimmed.startsWith('@base') || trimmed.startsWith('PREFIX') || trimmed.startsWith('BASE')) return;
+
+      const match = trimmed.match(tripleRegex);
+      if (match) {
+        matchedLines++;
+        const s = match[1].replace(/[<>]/g, '').trim();
+        const p = match[2].replace(/[<>]/g, '').trim();
+        const o = match[3].replace(/[<>]/g, '').replace(/^"(.*)"$/, '$1').trim();
+
+        addNode(s);
+        addNode(o);
         links.push({
-          source: subjId,
-          target: objId,
-          label: predId.split(/[\/#:]/).pop() || predId,
-          uri: predId
+          source: s,
+          target: o,
+          label: getShortLabel(p),
+          uri: p
         });
       }
     });
+
+    if (matchedLines === 0 && input.trim().length > 0) {
+      parseError = "No valid RDF triples found. Check format.";
+    }
   }
 
   return {
     nodes: Array.from(nodesMap.values()),
     links,
-    extraAttributes: Array.from(extraAttributes)
+    extraAttributes: Array.from(extraAttributes),
+    error: parseError
   };
 };
 
 export const sampleRDF = `
-<http://example.org/Alice> <http://schema.org/name> "Alice" .
-<http://example.org/Alice> <http://schema.org/knows> <http://example.org/Bob> .
-<http://example.org/Bob> <http://schema.org/name> "Bob" .
-<http://example.org/Bob> <http://schema.org/worksFor> <http://example.org/CompanyX> .
-<http://example.org/Alice> <http://schema.org/worksFor> <http://example.org/CompanyX> .
-<http://example.org/CompanyX> <http://schema.org/name> "Tech Corp" .
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE rdf:RDF [
+    <!ENTITY rdf 'http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <!ENTITY rdfs 'http://www.w3.org/2000/01/rdf-schema#'>
+    <!ENTITY wn20instances 'http://www.w3.org/2006/03/wn/wn20/instances/'>
+    <!ENTITY wn20schema 'http://www.w3.org/2006/03/wn/wn20/schema/'>
+]>
+
+<rdf:RDF
+    xmlns:rdf="&rdf;"
+    xmlns:rdfs="&rdfs;"
+    xmlns:wn20instances="&wn20instances;"
+    xmlns:wn20schema="&wn20schema;"
+    xml:lang="en-US">
+<rdf:Description rdf:about="&wn20instances;synset-cause_to_sleep-verb-1">
+  <wn20schema:causes rdf:resource="&wn20instances;synset-sleep-verb-1"/>
+</rdf:Description>
+
+<rdf:Description rdf:about="&wn20instances;synset-keep_up-verb-5">
+  <wn20schema:causes rdf:resource="&wn20instances;synset-stay_up-verb-1"/>
+</rdf:Description>
+
+<rdf:Description rdf:about="&wn20instances;synset-anesthetize-verb-1">
+  <wn20schema:causes rdf:resource="&wn20instances;synset-sleep-verb-1"/>
+</rdf:Description>
+</rdf:RDF>
 `;
 
 export const sampleJSON = `
 [
+  ["ex:Alice", "ex:knows", "ex:Bob"],
   {
-    "subject": "http://example.org/Alice",
-    "predicate": "http://schema.org/knows",
-    "object": "http://example.org/Bob",
-    "community_id": "Alpha",
-    "is_derived": true
-  },
-  {
-    "subject": "http://example.org/Bob",
-    "predicate": "http://schema.org/worksFor",
-    "object": "http://example.org/CompanyX",
-    "community_id": "Beta"
+    "s": "ex:Bob",
+    "p": "ex:worksFor",
+    "o": "ex:CompanyX",
+    "strength": 0.9
   }
 ]
 `;

@@ -1,18 +1,19 @@
 
 import React, { useEffect, useRef } from 'react';
 import * as d3 from 'd3';
-import { GraphData, GraphNode, GraphLink, PhysicsConfig, GroupingConfig } from '../types';
+import { GraphData, GraphNode, GraphLink, PhysicsConfig, GroupingConfig, EdgeConfig } from '../types';
 
 interface Props {
   data: GraphData;
   physics: PhysicsConfig;
+  edgeConfig: EdgeConfig;
   grouping: GroupingConfig;
   selectedNodeId: string | null;
   onNodeSelect: (id: string | null) => void;
   onEdgeSelect: (link: GraphLink | null) => void;
 }
 
-const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, onNodeSelect, onEdgeSelect }) => {
+const GraphView: React.FC<Props> = ({ data, physics, edgeConfig, grouping, selectedNodeId, onNodeSelect, onEdgeSelect }) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const simulationRef = useRef<d3.Simulation<GraphNode, GraphLink> | null>(null);
@@ -88,20 +89,22 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
     if (!svgRef.current) return;
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
+    
+    // defs are recreated based on edgeConfig colors and sizes
     const defs = svg.append('defs');
     
-    const createArrow = (id: string, color: string) => {
+    const createArrow = (id: string, color: string, size: number) => {
       defs.append('marker')
         .attr('id', id)
         .attr('viewBox', '0 -5 10 10')
         .attr('refX', 8).attr('refY', 0)
-        .attr('markerWidth', 6).attr('markerHeight', 6)
+        .attr('markerWidth', size).attr('markerHeight', size)
         .attr('orient', 'auto')
         .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', color);
     };
 
-    createArrow('arrowhead-default', '#475569');
-    createArrow('arrowhead-inferred', '#60a5fa');
+    createArrow('arrowhead-default', edgeConfig.explicit.color, edgeConfig.explicit.arrowSize);
+    createArrow('arrowhead-inferred', edgeConfig.inferred.color, edgeConfig.inferred.arrowSize);
 
     const g = svg.append('g').attr('class', 'main-container');
     (gRef as any).current = g.node();
@@ -115,7 +118,7 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
     
     zoomRef.current = zoom;
     svg.call(zoom);
-  }, []);
+  }, [edgeConfig]); // Re-create markers when config changes
 
   useEffect(() => {
     if (!gRef.current || !data.nodes.length) return;
@@ -169,10 +172,16 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
     const colorScale = d3.scaleOrdinal(grouping.palette);
 
     const link = g.select('.links-layer').selectAll<SVGLineElement, GraphLink>('line').data(data.links, getLinkId);
-    const linkEnter = link.enter().append('line').attr('class', 'graph-link').attr('stroke-width', 2).attr('stroke-opacity', 0.6).on('click', (event, d) => { event.stopPropagation(); onEdgeSelect(d); });
+    const linkEnter = link.enter().append('line').attr('class', 'graph-link').on('click', (event, d) => { event.stopPropagation(); onEdgeSelect(d); });
     const linkMerged = linkEnter.merge(link);
     link.exit().remove();
-    linkMerged.attr('stroke', d => d.isInferred ? '#60a5fa' : '#475569').attr('stroke-dasharray', d => d.isInferred ? '4,2' : 'none').attr('marker-end', d => d.isInferred ? 'url(#arrowhead-inferred)' : 'url(#arrowhead-default)');
+
+    linkMerged
+      .attr('stroke', d => d.isInferred ? edgeConfig.inferred.color : edgeConfig.explicit.color)
+      .attr('stroke-width', d => d.isInferred ? edgeConfig.inferred.width : edgeConfig.explicit.width)
+      .attr('stroke-opacity', d => d.isInferred ? edgeConfig.inferred.opacity : edgeConfig.explicit.opacity)
+      .attr('stroke-dasharray', d => d.isInferred ? '4,2' : 'none')
+      .attr('marker-end', d => d.isInferred ? 'url(#arrowhead-inferred)' : 'url(#arrowhead-default)');
 
     const linkLabel = g.select('.labels-layer').selectAll<SVGTextElement, GraphLink>('text').data(data.links, getLinkId);
     const linkLabelEnter = linkLabel.enter().append('text').attr('class', 'link-label').attr('font-size', '10px').attr('fill', '#94a3b8').attr('text-anchor', 'middle').attr('pointer-events', 'none');
@@ -210,13 +219,13 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
         if (!s.x || !t.x) return;
         const dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx*dx + dy*dy);
         if (dist === 0) return;
-        const tr = getRadius(t, degrees) + 5, sr = getRadius(s, degrees);
+        const tr = getRadius(t, degrees) + (d.isInferred ? edgeConfig.inferred.arrowSize : edgeConfig.explicit.arrowSize) - 1, sr = getRadius(s, degrees);
         d3.select(this).attr('x1', s.x + (dx*sr/dist)).attr('y1', s.y + (dy*sr/dist)).attr('x2', t.x - (dx*tr/dist)).attr('y2', t.y - (dy*tr/dist));
       });
       linkLabelMerged.attr('x', d => ((d.source as any).x + (d.target as any).x) / 2).attr('y', d => ((d.source as any).y + (d.target as any).y) / 2);
       nodeMerged.attr('transform', d => `translate(${d.x},${d.y})`);
     });
-  }, [data, physics, grouping]);
+  }, [data, physics, edgeConfig, grouping]);
 
   useEffect(() => {
     if (!simulationRef.current || !gRef.current) return;
@@ -232,7 +241,7 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
         if (t === selectedNodeId) neighbors.add(s);
       });
 
-      if (physics.disentangleFactor > 0) {
+      if (physics.enableDisentangle && physics.disentangleFactor > 0) {
         const selNode = data.nodes.find(n => n.id === selectedNodeId);
         if (selNode) {
           simulation.force('radial', d3.forceRadial(
@@ -242,6 +251,8 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
           ).strength(0.6));
           simulation.alpha(0.3).restart();
         }
+      } else {
+        simulation.force('radial', null);
       }
     } else {
       simulation.force('radial', null);
@@ -255,7 +266,7 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
     if (!selectedNodeId) {
       nodes.transition().duration(300).style('opacity', 1);
       nodes.select('.node-halo').transition().duration(300).attr('stroke-width', 0).attr('opacity', 0);
-      links.transition().duration(300).style('opacity', 0.6).attr('stroke-width', 2);
+      links.transition().duration(300).style('opacity', d => d.isInferred ? edgeConfig.inferred.opacity : edgeConfig.explicit.opacity);
       labels.transition().duration(300).style('opacity', 1);
     } else {
       nodes.transition().duration(300).style('opacity', d => neighbors.has(d.id) ? 1 : physics.dimmingOpacity);
@@ -266,11 +277,13 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
       links.transition().duration(300).style('opacity', l => {
         const s = typeof l.source === 'object' ? (l.source as any).id : l.source;
         const t = typeof l.target === 'object' ? (l.target as any).id : l.target;
-        return (s === selectedNodeId || t === selectedNodeId) ? 1 : Math.max(0.01, physics.dimmingOpacity / 2);
+        const baseOpacity = l.isInferred ? edgeConfig.inferred.opacity : edgeConfig.explicit.opacity;
+        return (s === selectedNodeId || t === selectedNodeId) ? 1 : Math.max(0.01, (physics.dimmingOpacity * baseOpacity));
       }).attr('stroke-width', l => {
         const s = typeof l.source === 'object' ? (l.source as any).id : l.source;
         const t = typeof l.target === 'object' ? (l.target as any).id : l.target;
-        return (s === selectedNodeId || t === selectedNodeId) ? 4 : 2;
+        const baseWidth = l.isInferred ? edgeConfig.inferred.width : edgeConfig.explicit.width;
+        return (s === selectedNodeId || t === selectedNodeId) ? baseWidth * 2 : baseWidth;
       });
       
       labels.transition().duration(300).style('opacity', l => {
@@ -279,7 +292,7 @@ const GraphView: React.FC<Props> = ({ data, physics, grouping, selectedNodeId, o
         return (s === selectedNodeId || t === selectedNodeId) ? 1 : Math.max(0.01, physics.dimmingOpacity / 2);
       });
     }
-  }, [selectedNodeId, physics.disentangleFactor, physics.dimmingOpacity, data]);
+  }, [selectedNodeId, physics.enableDisentangle, physics.disentangleFactor, physics.dimmingOpacity, data, edgeConfig]);
 
   return (
     <div ref={containerRef} className="w-full h-full bg-slate-900 overflow-hidden relative" onClick={() => onNodeSelect(null)}>

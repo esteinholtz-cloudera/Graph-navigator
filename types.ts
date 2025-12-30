@@ -32,6 +32,7 @@ export interface GraphData {
   nodes: GraphNode[];
   links: GraphLink[];
   extraAttributes: string[];
+  error?: string; // New field for reporting parsing issues
 }
 
 export type MappingTarget = 'Inferred' | 'chunk' | 'Community' | 'None';
@@ -40,12 +41,25 @@ export interface AttributeMapping {
   [key: string]: MappingTarget;
 }
 
+export interface EdgeStyle {
+  color: string;
+  width: number;
+  opacity: number;
+  arrowSize: number;
+}
+
+export interface EdgeConfig {
+  explicit: EdgeStyle;
+  inferred: EdgeStyle;
+}
+
 export interface PhysicsConfig {
   charge: number;
   linkDistance: number;
   collisionRadius: number;
   centering: boolean;
   disentangleFactor: number;
+  enableDisentangle: boolean;
   friction: number; // velocityDecay
   gravity: number;  // centering force strength
   dimmingOpacity: number; // For non-highlighted parts
