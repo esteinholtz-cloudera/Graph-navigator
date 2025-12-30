@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import GraphView from './components/GraphView';
 import { GraphData, PhysicsConfig, GroupingConfig, GraphLink, AttributeMapping, MappingTarget, GraphNode, EdgeConfig } from './types';
@@ -13,6 +12,8 @@ const MAX_KB = 5000;
 const logToValue = (val: number) => Math.round(MIN_KB * Math.pow(MAX_KB / MIN_KB, val / 100));
 const valueToLog = (val: number) => (Math.log(val / MIN_KB) / Math.log(MAX_KB / MIN_KB)) * 100;
 
+type ViewMode = 'all' | 'explore';
+
 const App: React.FC = () => {
   const [input, setInput] = useState(sampleRDF);
   const [format, setFormat] = useState<'rdf' | 'json'>('rdf');
@@ -25,6 +26,10 @@ const App: React.FC = () => {
   const [showMappingModal, setShowMappingModal] = useState(false);
   const [showInferred, setShowInferred] = useState(true);
   const [maxFileKb, setMaxFileKb] = useState(1000); // Default 1MB
+
+  // Exploration state
+  const [viewMode, setViewMode] = useState<ViewMode>('explore');
+  const [exploredNodeIds, setExploredNodeIds] = useState<Set<string>>(new Set());
   
   const [mappings, setMappings] = useState<AttributeMapping>(() => {
     try {
@@ -66,10 +71,33 @@ const App: React.FC = () => {
     localStorage.setItem(MAPPINGS_STORAGE_KEY, JSON.stringify(mappings));
   }, [mappings]);
 
+  // Load and parse initial data
   useEffect(() => {
     const data = parseInputToGraph(input, format);
     setRawGraphData(data);
     
+    // Auto-seed for Explore mode: pick the single most connected node
+    if (data.nodes.length > 0) {
+      const degrees = new Map<string, number>();
+      data.links.forEach(l => {
+        const s = typeof l.source === 'string' ? l.source : (l.source as any).id;
+        const t = typeof l.target === 'string' ? l.target : (l.target as any).id;
+        degrees.set(s, (degrees.get(s) || 0) + 1);
+        degrees.set(t, (degrees.get(t) || 0) + 1);
+      });
+
+      let maxDeg = -1;
+      let seed: string | null = null;
+      data.nodes.forEach(n => {
+        const d = degrees.get(n.id) || 0;
+        if (d > maxDeg) {
+          maxDeg = d;
+          seed = n.id;
+        }
+      });
+      if (seed) setExploredNodeIds(new Set([seed]));
+    }
+
     if (data.extraAttributes.length > 0) {
       const unknownAttributes = data.extraAttributes.filter(attr => !(attr in mappings));
       if (unknownAttributes.length > 0) {
@@ -85,38 +113,97 @@ const App: React.FC = () => {
     }
   }, [input, format]);
 
-  const processedGraphData = useMemo(() => {
-    const nodes = rawGraphData.nodes.map(node => {
-      const newNode = { ...node };
+  // Calculate global degrees for consistent node sizing across all modes
+  const globalDegrees = useMemo(() => {
+    const degrees = new Map<string, number>();
+    rawGraphData.nodes.forEach(n => degrees.set(n.id, 0));
+    rawGraphData.links.forEach(l => {
+      const s = typeof l.source === 'string' ? l.source : (l.source as any).id;
+      const t = typeof l.target === 'string' ? l.target : (l.target as any).id;
+      
+      // Determine if inferred based on current mappings
+      let isInferred = l.isInferred ?? false;
       Object.entries(mappings).forEach(([attr, target]) => {
-        const val = node.metadata?.[attr];
-        if (val !== undefined && target !== 'None') {
-          if (target === 'chunk') newNode.chunk = String(val);
-          if (target === 'Community') newNode.community = String(val);
+        const val = l.metadata?.[attr];
+        if (val !== undefined && target === 'Inferred') {
+          isInferred = !!val;
         }
       });
-      return newNode;
-    });
 
-    const links = rawGraphData.links
-      .map(link => {
-        const newLink = { 
-          ...link,
-          source: typeof link.source === 'object' ? (link.source as any).id : link.source,
-          target: typeof link.target === 'object' ? (link.target as any).id : link.target
-        };
+      if (showInferred || !isInferred) {
+        degrees.set(s, (degrees.get(s) || 0) + 1);
+        degrees.set(t, (degrees.get(t) || 0) + 1);
+      }
+    });
+    return degrees;
+  }, [rawGraphData, mappings, showInferred]);
+
+  const processedGraphData = useMemo(() => {
+    // 1. Prepare base links and identify inferred status
+    const allLinks = rawGraphData.links.map(link => {
+      const sourceId = (typeof link.source === 'object' ? (link.source as GraphNode).id : link.source) as string;
+      const targetId = (typeof link.target === 'object' ? (link.target as GraphNode).id : link.target) as string;
+      
+      let isInferred = link.isInferred ?? false;
+      Object.entries(mappings).forEach(([attr, target]) => {
+        const val = link.metadata?.[attr];
+        if (val !== undefined && target === 'Inferred') {
+          isInferred = !!val;
+        }
+      });
+
+      return { ...link, sourceId, targetId, isInferred };
+    }).filter(link => showInferred || !link.isInferred);
+
+    // 2. Filter logic for View Modes
+    let visibleNodeIds = new Set<string>();
+    let visibleLinks: any[] = [];
+
+    if (viewMode === 'all') {
+      visibleNodeIds = new Set<string>(rawGraphData.nodes.map(n => n.id));
+      visibleLinks = allLinks;
+    } else {
+      // Explore mode incremental expansion logic
+      const explored = exploredNodeIds;
+      const neighbors = new Set<string>();
+      
+      allLinks.forEach(link => {
+        if (explored.has(link.sourceId)) neighbors.add(link.targetId);
+        if (explored.has(link.targetId)) neighbors.add(link.sourceId);
+      });
+
+      // Nodes are visible if they are explored OR neighbor of an explored node
+      visibleNodeIds = new Set<string>([...Array.from(explored), ...Array.from(neighbors)] as string[]);
+      
+      // Links are visible if they connect to at least one explored node
+      visibleLinks = allLinks.filter(link => 
+        explored.has(link.sourceId) || explored.has(link.targetId)
+      );
+    }
+
+    // 3. Final graph construction
+    const nodes = rawGraphData.nodes
+      .filter(n => visibleNodeIds.has(n.id))
+      .map(node => {
+        const newNode = { ...node };
         Object.entries(mappings).forEach(([attr, target]) => {
-          const val = link.metadata?.[attr];
-          if (val !== undefined && target === 'Inferred') {
-            newLink.isInferred = !!val;
+          const val = node.metadata?.[attr];
+          if (val !== undefined && target !== 'None') {
+            if (target === 'chunk') newNode.chunk = String(val);
+            if (target === 'Community') newNode.community = String(val);
           }
         });
-        return newLink;
-      })
-      .filter(link => showInferred || !link.isInferred);
+        return newNode;
+      });
+
+    const links = visibleLinks.map(l => ({
+      ...l,
+      source: l.sourceId,
+      target: l.targetId
+    }));
 
     return { nodes, links, extraAttributes: rawGraphData.extraAttributes };
-  }, [rawGraphData, mappings, showInferred]);
+  }, [rawGraphData, mappings, showInferred, viewMode, exploredNodeIds]);
 
   const handleAiAnalysis = async () => {
     if (!selectedEdge) return;
@@ -134,84 +221,77 @@ const App: React.FC = () => {
     }
   };
 
-  /**
-   * Cleans up truncated data to avoid parser errors (like premature end of XML tags).
-   */
   const sanitizeTruncatedContent = (content: string): string => {
     const trimmed = content.trim();
-    
-    // Heuristic for RDF/XML
     if (trimmed.startsWith('<')) {
-      // Find the last complete Description tag
       const lastDescEnd = content.lastIndexOf('</rdf:Description>');
-      if (lastDescEnd !== -1) {
-        return content.substring(0, lastDescEnd + 18) + '\n</rdf:RDF>';
-      }
-      // If we don't find Description, try to find any closing tag and close root
+      if (lastDescEnd !== -1) return content.substring(0, lastDescEnd + 18) + '\n</rdf:RDF>';
       const lastClosingTag = content.lastIndexOf('</');
       if (lastClosingTag !== -1) {
         const nextClosing = content.indexOf('>', lastClosingTag);
-        if (nextClosing !== -1) {
-          return content.substring(0, nextClosing + 1) + '\n</rdf:RDF>';
-        }
+        if (nextClosing !== -1) return content.substring(0, nextClosing + 1) + '\n</rdf:RDF>';
       }
       return content + '\n</rdf:RDF>';
     }
-
-    // Heuristic for JSON / JSON-LD
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
       const lastBrace = Math.max(content.lastIndexOf('}'), content.lastIndexOf(']'));
-      if (lastBrace !== -1) {
-        return content.substring(0, lastBrace + 1);
-      }
+      if (lastBrace !== -1) return content.substring(0, lastBrace + 1);
     }
-
-    // Heuristic for N-Triples / Turtle
-    // Find the last full-stop at the end of a line
     const lastDot = content.lastIndexOf('.');
-    if (lastDot !== -1) {
-      return content.substring(0, lastDot + 1);
-    }
-
+    if (lastDot !== -1) return content.substring(0, lastDot + 1);
     return content;
   };
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
     const limitBytes = maxFileKb * 1024;
     const reader = new FileReader();
-    
-    // Read slightly more than limit to find a good breaking point
     const isOverLimit = file.size > limitBytes;
-    const extraLookahead = 8192; // 8KB lookahead for richer heuristics
-    const blobToRead = isOverLimit ? file.slice(0, limitBytes + extraLookahead) : file;
-
+    const blobToRead = isOverLimit ? file.slice(0, limitBytes + 8192) : file;
     reader.onload = (e) => {
       let content = e.target?.result as string;
       if (content) {
-        if (isOverLimit) {
-          content = sanitizeTruncatedContent(content);
-        }
-
+        if (isOverLimit) content = sanitizeTruncatedContent(content);
         const extension = file.name.split('.').pop()?.toLowerCase();
-        const isJson = extension === 'json' || extension === 'jsonld';
-        setFormat(isJson ? 'json' : 'rdf');
+        setFormat(extension === 'json' || extension === 'jsonld' ? 'json' : 'rdf');
         setInput(content);
       }
     };
-
     reader.readAsText(blobToRead);
-
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const updateEdgeStyle = (type: 'explicit' | 'inferred', key: keyof typeof edgeConfig.explicit, value: any) => {
-    setEdgeConfig(prev => ({
-      ...prev,
-      [type]: { ...prev[type], [key]: value }
-    }));
+  const handleNodeClick = (id: string | null) => {
+    if (!id) {
+      setSelectedNodeId(null);
+      return;
+    }
+    setSelectedNodeId(id);
+    setSelectedEdge(null);
+    setAiAnalysis(null);
+
+    // Expand discovery core in Explore mode
+    if (viewMode === 'explore') {
+      setExploredNodeIds(prev => new Set([...Array.from(prev), id]));
+    }
+  };
+
+  const resetExploration = () => {
+    if (rawGraphData.nodes.length > 0) {
+      // Find top connectivity node again for reset
+      const degrees = globalDegrees;
+      let maxDeg = -1;
+      let seed: string | null = null;
+      rawGraphData.nodes.forEach(n => {
+        const d = degrees.get(n.id) || 0;
+        if (d > maxDeg) {
+          maxDeg = d;
+          seed = n.id;
+        }
+      });
+      if (seed) setExploredNodeIds(new Set([seed]));
+    }
   };
 
   return (
@@ -255,123 +335,59 @@ const App: React.FC = () => {
           <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center font-bold text-lg text-white">G</div>
           <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">RDF Graph Navigator</h1>
         </div>
-        <div className="flex gap-2">
-           <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">Load File</button>
-           <button onClick={() => { setFormat('rdf'); setInput(sampleRDF); }} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-md text-sm border border-slate-700">Sample RDF</button>
-           <button onClick={() => { setFormat('json'); setInput(sampleJSON); }} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-md text-sm border border-slate-700">Sample JSON</button>
-           {rawGraphData.extraAttributes.length > 0 && (
-             <button onClick={() => setShowMappingModal(true)} className="px-3 py-1.5 bg-indigo-900/50 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-900 hover:text-white rounded-md text-sm">Configure Mappings</button>
-           )}
+
+        <div className="flex items-center gap-4">
+          <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 p-1">
+            <select 
+              value={viewMode}
+              onChange={(e) => setViewMode(e.target.value as ViewMode)}
+              className="bg-transparent text-sm font-medium px-2 py-1 outline-none text-slate-200 cursor-pointer"
+            >
+              <option value="all">View: Show All</option>
+              <option value="explore">View: Explore</option>
+            </select>
+            {viewMode === 'explore' && (
+              <button 
+                onClick={resetExploration}
+                className="ml-1 p-1 hover:bg-slate-700 rounded transition-colors text-slate-400"
+                title="Reset Exploration"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+              </button>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">Load File</button>
+            <button onClick={() => setInput(sampleRDF)} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-md text-sm border border-slate-700">Sample RDF</button>
+            <button onClick={() => setInput(sampleJSON)} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-md text-sm border border-slate-700">Sample JSON</button>
+          </div>
         </div>
       </header>
 
       <main className="flex flex-1 overflow-hidden relative">
         <aside className="w-80 border-r border-slate-800 bg-slate-900/80 p-4 flex flex-col gap-6 overflow-y-auto z-10">
           <section>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Input Data</h2>
-              <button onClick={() => setInput("")} className="text-[10px] text-slate-500 hover:text-red-400 transition-colors">Clear</button>
-            </div>
-            
+            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Input Data</h2>
             <div className="mb-4 space-y-2">
               <div className="flex justify-between text-[10px] text-slate-400 uppercase font-bold">
                 <span>Max Load Size</span>
-                <span className="text-blue-400">
-                  {maxFileKb >= 1000 ? `${(maxFileKb / 1000).toFixed(1)} MB` : `${maxFileKb} KB`}
-                </span>
+                <span className="text-blue-400">{maxFileKb >= 1000 ? `${(maxFileKb / 1000).toFixed(1)} MB` : `${maxFileKb} KB`}</span>
               </div>
-              <input 
-                type="range" 
-                min="0" 
-                max="100" 
-                value={valueToLog(maxFileKb)} 
-                onChange={(e) => setMaxFileKb(logToValue(Number(e.target.value)))}
-                className="w-full h-1 bg-slate-800 accent-blue-600 rounded-lg cursor-pointer"
-              />
-              <p className="text-[9px] text-slate-500 italic">Reading cleans up truncated syntax for safe parsing.</p>
+              <input type="range" min="0" max="100" value={valueToLog(maxFileKb)} onChange={(e) => setMaxFileKb(logToValue(Number(e.target.value)))} className="w-full h-1 bg-slate-800 accent-blue-600 rounded-lg cursor-pointer" />
             </div>
-
-            <div className="flex gap-2 mb-2">
-              <button onClick={() => setFormat('rdf')} className={`flex-1 py-1 text-xs rounded border ${format === 'rdf' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>RDF</button>
-              <button onClick={() => setFormat('json')} className={`flex-1 py-1 text-xs rounded border ${format === 'json' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-400'}`}>JSON-LD</button>
-            </div>
-            <textarea 
-              value={input} 
-              onChange={(e) => setInput(e.target.value)} 
-              className={`w-full h-32 bg-slate-800 border ${rawGraphData.error ? 'border-red-500/50' : 'border-slate-700'} rounded p-2 text-xs font-mono text-blue-300 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-none`} 
-              placeholder="Paste data here..." 
-            />
-            {rawGraphData.error && (
-              <div className="mt-2 p-2 bg-red-950/30 border border-red-500/20 rounded text-[10px] text-red-400 leading-tight">
-                <strong>Error:</strong> {rawGraphData.error}
-              </div>
-            )}
+            <textarea value={input} onChange={(e) => setInput(e.target.value)} className="w-full h-32 bg-slate-800 border border-slate-700 rounded p-2 text-xs font-mono text-blue-300 focus:outline-none resize-none" />
           </section>
 
           <section>
             <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">Physics</h2>
             <div className="space-y-4">
               <div className="space-y-1">
-                <div className="flex justify-between text-xs"><span>Charge (Repulsion)</span><span className="text-blue-400">{physics.charge}</span></div>
+                <div className="flex justify-between text-xs"><span>Charge</span><span className="text-blue-400">{physics.charge}</span></div>
                 <input type="range" min="-1000" max="0" value={physics.charge} onChange={(e) => setPhysics({ ...physics, charge: Number(e.target.value) })} className="w-full accent-blue-500" />
               </div>
               <div className="space-y-1">
                 <div className="flex justify-between text-xs"><span>Link Distance</span><span className="text-blue-400">{physics.linkDistance}px</span></div>
                 <input type="range" min="20" max="300" value={physics.linkDistance} onChange={(e) => setPhysics({ ...physics, linkDistance: Number(e.target.value) })} className="w-full accent-blue-500" />
-              </div>
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <div className="text-xs"><span>Disentangle (Lens)</span><span className="text-blue-400 ml-2">{Math.round(physics.disentangleFactor * 100)}%</span></div>
-                  <input type="checkbox" checked={physics.enableDisentangle} onChange={(e) => setPhysics({ ...physics, enableDisentangle: e.target.checked })} className="w-4 h-4 accent-blue-500" title="Enable/Disable Disentanglement Force" />
-                </div>
-                <input type="range" min="0" max="1" step="0.1" disabled={!physics.enableDisentangle} value={physics.disentangleFactor} onChange={(e) => setPhysics({ ...physics, disentangleFactor: Number(e.target.value) })} className={`w-full accent-blue-500 ${!physics.enableDisentangle ? 'opacity-30 cursor-not-allowed' : ''}`} />
-              </div>
-            </div>
-          </section>
-
-          <section>
-            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">Edge Customization</h2>
-            <div className="space-y-6">
-              {/* Explicit Edges */}
-              <div className="space-y-3 p-3 bg-slate-800/40 rounded-lg border border-slate-700/50">
-                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Explicit Edges</h3>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-slate-300">Color</span>
-                  <input type="color" value={edgeConfig.explicit.color} onChange={(e) => updateEdgeStyle('explicit', 'color', e.target.value)} className="w-6 h-6 rounded bg-transparent border-none cursor-pointer" />
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px]"><span>Width</span><span className="text-blue-400">{edgeConfig.explicit.width}px</span></div>
-                  <input type="range" min="1" max="10" value={edgeConfig.explicit.width} onChange={(e) => updateEdgeStyle('explicit', 'width', Number(e.target.value))} className="w-full h-1 accent-blue-500" />
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px]"><span>Opacity</span><span className="text-blue-400">{Math.round(edgeConfig.explicit.opacity * 100)}%</span></div>
-                  <input type="range" min="0.1" max="1" step="0.05" value={edgeConfig.explicit.opacity} onChange={(e) => updateEdgeStyle('explicit', 'opacity', Number(e.target.value))} className="w-full h-1 accent-blue-500" />
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px]"><span>Arrow Size</span><span className="text-blue-400">{edgeConfig.explicit.arrowSize}</span></div>
-                  <input type="range" min="2" max="15" value={edgeConfig.explicit.arrowSize} onChange={(e) => updateEdgeStyle('explicit', 'arrowSize', Number(e.target.value))} className="w-full h-1 accent-blue-500" />
-                </div>
-              </div>
-
-              {/* Inferred Edges */}
-              <div className="space-y-3 p-3 bg-slate-800/40 rounded-lg border border-slate-700/50">
-                <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Inferred Edges</h3>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-slate-300">Color</span>
-                  <input type="color" value={edgeConfig.inferred.color} onChange={(e) => updateEdgeStyle('inferred', 'color', e.target.value)} className="w-6 h-6 rounded bg-transparent border-none cursor-pointer" />
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px]"><span>Width</span><span className="text-blue-400">{edgeConfig.inferred.width}px</span></div>
-                  <input type="range" min="1" max="10" value={edgeConfig.inferred.width} onChange={(e) => updateEdgeStyle('inferred', 'width', Number(e.target.value))} className="w-full h-1 accent-blue-400" />
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px]"><span>Opacity</span><span className="text-blue-400">{Math.round(edgeConfig.inferred.opacity * 100)}%</span></div>
-                  <input type="range" min="0.1" max="1" step="0.05" value={edgeConfig.inferred.opacity} onChange={(e) => updateEdgeStyle('inferred', 'opacity', Number(e.target.value))} className="w-full h-1 accent-blue-400" />
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px]"><span>Arrow Size</span><span className="text-blue-400">{edgeConfig.inferred.arrowSize}</span></div>
-                  <input type="range" min="2" max="15" value={edgeConfig.inferred.arrowSize} onChange={(e) => updateEdgeStyle('inferred', 'arrowSize', Number(e.target.value))} className="w-full h-1 accent-blue-400" />
-                </div>
               </div>
             </div>
           </section>
@@ -384,20 +400,12 @@ const App: React.FC = () => {
                 <span className="text-sm text-slate-300">Group by Community</span>
               </label>
               <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={grouping.showNamespaces} onChange={(e) => setGrouping({ ...grouping, showNamespaces: e.target.checked })} className="w-4 h-4 accent-blue-500" />
-                <span className="text-sm text-slate-300">Show Namespaces (URIs)</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={showInferred} onChange={(e) => setShowInferred(e.target.checked)} className="w-4 h-4 accent-blue-500" />
                 <span className="text-sm text-slate-300">Show Inferred Edges</span>
               </label>
               <div className="space-y-1">
                 <div className="flex justify-between text-xs"><span>Hub Scaling</span><span className="text-blue-400">{grouping.connectivityEnlargement}%</span></div>
                 <input type="range" min="0" max="100" value={grouping.connectivityEnlargement} onChange={(e) => setGrouping({ ...grouping, connectivityEnlargement: Number(e.target.value) })} className="w-full accent-blue-500" />
-              </div>
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs"><span>Focus Intensity</span><span className="text-blue-400">{Math.round((1 - physics.dimmingOpacity) * 100)}%</span></div>
-                <input type="range" min="0" max="0.95" step="0.05" value={1 - physics.dimmingOpacity} onChange={(e) => setPhysics({ ...physics, dimmingOpacity: Math.max(0.01, 1 - Number(e.target.value)) })} className="w-full accent-blue-500" />
               </div>
             </div>
           </section>
@@ -410,52 +418,33 @@ const App: React.FC = () => {
             edgeConfig={edgeConfig}
             grouping={grouping}
             selectedNodeId={selectedNodeId}
-            onNodeSelect={(id) => { setSelectedNodeId(id); setSelectedEdge(null); setAiAnalysis(null); }}
-            onEdgeSelect={(link) => { setSelectedEdge(link); setSelectedNodeId(null); setAiAnalysis(null); }}
+            onNodeSelect={handleNodeClick}
+            onEdgeSelect={(link) => { setSelectedEdge(link); setSelectedNodeId(null); }}
+            globalDegrees={globalDegrees}
           />
 
-          <div className="absolute bottom-6 right-6 bg-slate-900/90 backdrop-blur-md border border-slate-700 rounded-xl p-4 shadow-2xl z-20 pointer-events-none min-w-[180px]">
-            <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3">Legend</h3>
-            <div className="space-y-3 text-[10px] text-slate-300">
-              <div className="flex items-center gap-3"><div className="w-4 h-0.5" style={{backgroundColor: edgeConfig.explicit.color}}></div><span>Explicit</span></div>
-              <div className="flex items-center gap-3"><div className="w-4 h-0.5 border-t-2 border-dashed" style={{borderColor: edgeConfig.inferred.color}}></div><span>Inferred</span></div>
-              <div className="flex items-center gap-3"><div className="w-3 h-3 rounded-full bg-slate-600 border border-slate-400"></div><span>Entity</span></div>
-              <div className="flex items-center gap-3"><div className="w-5 h-5 rounded-full bg-blue-500 border-2 border-white"></div><span>Hub / Chunk</span></div>
-            </div>
+          <div className="absolute bottom-6 left-6 bg-slate-900/60 backdrop-blur-md p-2 rounded text-[10px] text-slate-400 flex items-center gap-2 pointer-events-none uppercase tracking-tighter">
+            <span className="font-bold text-slate-500">Mode:</span>
+            <span>{viewMode === 'all' ? 'All Data Visible' : 'Explore (Click nodes to reveal neighbors)'}</span>
           </div>
 
           {(selectedNodeId || selectedEdge) && (
-            <div className="absolute right-6 top-6 w-80 bg-slate-900/95 border border-slate-700 rounded-xl p-5 shadow-2xl backdrop-blur-md z-30">
+            <div className="absolute right-6 top-6 w-80 bg-slate-900/95 border border-slate-700 rounded-xl p-5 shadow-2xl backdrop-blur-md z-30 animate-in fade-in slide-in-from-right-4">
               {selectedNodeId ? (
-                (() => {
-                  const node = processedGraphData.nodes.find(n => n.id === selectedNodeId);
-                  return (
-                    <div>
-                      <h3 className="text-blue-400 text-xs font-bold uppercase mb-1">Entity Details</h3>
-                      <p className="text-lg font-bold break-all text-white">{node?.label}</p>
-                      <p className="text-[10px] text-slate-500 break-all mt-1 font-mono">{selectedNodeId}</p>
-                      <div className="mt-4 border-t border-slate-800 pt-4 text-xs">
-                        {node?.community && <div className="flex justify-between"><span>Community:</span> <span className="text-blue-300 font-bold">{node.community}</span></div>}
-                        {node?.chunk && <div className="mt-2 p-2 bg-slate-800 rounded"><span>Context:</span> <p className="text-slate-400 italic mt-1">{node.chunk}</p></div>}
-                      </div>
-                    </div>
-                  );
-                })()
+                <div>
+                  <h3 className="text-blue-400 text-xs font-bold uppercase mb-1">Node Info</h3>
+                  <p className="text-lg font-bold text-white break-all">{processedGraphData.nodes.find(n => n.id === selectedNodeId)?.label}</p>
+                  <p className="text-[10px] text-slate-500 font-mono mt-1 break-all">{selectedNodeId}</p>
+                </div>
               ) : selectedEdge ? (
                 <div className="space-y-4">
                   <div>
                     <h3 className="text-blue-400 text-xs font-bold uppercase mb-1">Relationship</h3>
-                    <div className="flex flex-col gap-1">
-                      <p className="text-sm text-slate-300">{typeof selectedEdge.source === 'string' ? selectedEdge.source : (selectedEdge.source as any).label}</p>
-                      <div className={`px-2 py-1 border rounded w-fit text-xs my-1 font-bold ${selectedEdge.isInferred ? 'border-dashed' : 'border-solid'}`} style={{
-                        borderColor: selectedEdge.isInferred ? edgeConfig.inferred.color : edgeConfig.explicit.color,
-                        backgroundColor: `${selectedEdge.isInferred ? edgeConfig.inferred.color : edgeConfig.explicit.color}22`,
-                        color: selectedEdge.isInferred ? edgeConfig.inferred.color : '#fff'
-                      }}>{selectedEdge.label}</div>
-                      <p className="text-sm text-slate-300">{typeof selectedEdge.target === 'string' ? selectedEdge.target : (selectedEdge.target as any).label}</p>
-                    </div>
+                    <p className="text-sm font-bold">{selectedEdge.label}</p>
                   </div>
-                  <button onClick={handleAiAnalysis} disabled={isLoadingAi} className="w-full py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-bold text-white">Semantic Analysis</button>
+                  <button onClick={handleAiAnalysis} disabled={isLoadingAi} className="w-full py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-bold text-white transition-colors">
+                    {isLoadingAi ? 'Analyzing...' : 'Semantic Analysis'}
+                  </button>
                   {aiAnalysis && <div className="bg-slate-800 rounded-lg p-3 text-xs text-slate-300 border-l-4 border-l-blue-500 leading-relaxed">{aiAnalysis}</div>}
                 </div>
               ) : null}
@@ -469,10 +458,10 @@ const App: React.FC = () => {
 
       <footer className="h-8 border-t border-slate-800 bg-slate-900 flex items-center justify-between px-6 text-[10px] text-slate-500">
         <div className="flex gap-4">
-          <span>Nodes: {processedGraphData.nodes.length}</span>
-          <span>Edges: {processedGraphData.links.length}</span>
+          <span>Nodes: {processedGraphData.nodes.length} / {rawGraphData.nodes.length}</span>
+          <span>Edges: {processedGraphData.links.length} / {rawGraphData.links.length}</span>
         </div>
-        <div>Visibility Optimized • Gemini 3 Flash • D3.js</div>
+        <div>Dynamic Discovery Mode • RDF Navigator</div>
       </footer>
     </div>
   );
