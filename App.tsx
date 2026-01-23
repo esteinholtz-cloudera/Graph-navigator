@@ -1,47 +1,39 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import GraphView from './components/GraphView';
-import { GraphData, PhysicsConfig, GroupingConfig, GraphLink, AttributeMapping, MappingTarget, GraphNode, EdgeConfig } from './types';
-import { parseInputToGraph, sampleRDF, sampleJSON } from './services/rdfParser';
-import { analyzeRelationship } from './services/geminiService';
+import Header from './components/Header';
+import Sidebar from './components/Sidebar';
+import SelectionPanel from './components/SelectionPanel';
+import MappingModal from './components/MappingModal';
+import { PhysicsConfig, GroupingConfig, GraphLink, MappingTarget, GraphNode, EdgeConfig, AttributeMapping } from './types';
+import { parseInputToGraph, sampleRDF } from './services/rdfParser';
+import { analyzeRelationship, analyzeGroupSemantics } from './services/geminiService';
+import { useGraphStore } from './hooks/useGraphStore';
+import { getMemoryStatus, MemoryStatus } from './services/memoryMonitor';
+import { findCommonNeighbors, findPaths, getNeighbors } from './services/graphAlgorithms';
 
-const MAPPINGS_STORAGE_KEY = 'rdf-graph-navigator-mappings';
-
-// Logarithmic helper for slider: 5KB to 5000KB
-const MIN_KB = 5;
-const MAX_KB = 5000;
-const logToValue = (val: number) => Math.round(MIN_KB * Math.pow(MAX_KB / MIN_KB, val / 100));
-const valueToLog = (val: number) => (Math.log(val / MIN_KB) / Math.log(MAX_KB / MIN_KB)) * 100;
-
-type ViewMode = 'all' | 'explore';
+const STORAGE_PREFIX = 'rdf_nav_mappings_';
+const USE_GEMINI = process.env.USE_GEMINI === 'true';
 
 const App: React.FC = () => {
+  const store = useGraphStore();
   const [input, setInput] = useState(sampleRDF);
   const [format, setFormat] = useState<'rdf' | 'json'>('rdf');
-  const [rawGraphData, setRawGraphData] = useState<GraphData>({ nodes: [], links: [], extraAttributes: [] });
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [currentFileName, setCurrentFileName] = useState<string>('sample.rdf');
   const [selectedEdge, setSelectedEdge] = useState<GraphLink | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [isLoadingAi, setIsLoadingAi] = useState(false);
-  
   const [showMappingModal, setShowMappingModal] = useState(false);
-  const [showInferred, setShowInferred] = useState(true);
-  const [maxFileKb, setMaxFileKb] = useState(1000); // Default 1MB
-
-  // Exploration state
-  const [viewMode, setViewMode] = useState<ViewMode>('explore');
-  const [exploredNodeIds, setExploredNodeIds] = useState<Set<string>>(new Set());
-  
-  const [mappings, setMappings] = useState<AttributeMapping>(() => {
-    try {
-      const saved = localStorage.getItem(MAPPINGS_STORAGE_KEY);
-      return saved ? JSON.parse(saved) : {};
-    } catch (e) {
-      console.error('Failed to load mappings from storage', e);
-      return {};
-    }
-  });
+  const [memStatus, setMemStatus] = useState<MemoryStatus | null>(null);
+  const [simState, setSimState] = useState({ isRunning: false, alpha: 0 });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Monitor Memory
+  useEffect(() => {
+    const interval = setInterval(() => setMemStatus(getMemoryStatus()), 2000);
+    return () => clearInterval(interval);
+  }, []);
 
   const [physics, setPhysics] = useState<PhysicsConfig>({
     charge: -300,
@@ -52,417 +44,408 @@ const App: React.FC = () => {
     enableDisentangle: true,
     friction: 0.4,
     gravity: 0.1,
-    dimmingOpacity: 0.15
+    dimmingOpacity: 0.7,
+    autoFreeze: true,
+    isPhysicsEnabled: true,
+    stabilizationThreshold: 0.01
   });
 
-  const [edgeConfig, setEdgeConfig] = useState<EdgeConfig>({
+  const edgeConfig = useMemo<EdgeConfig>(() => ({
     explicit: { color: '#475569', width: 2, opacity: 0.6, arrowSize: 6 },
     inferred: { color: '#60a5fa', width: 2, opacity: 0.6, arrowSize: 6 }
-  });
+  }), []);
 
   const [grouping, setGrouping] = useState<GroupingConfig>({
-    byType: true,
+    groupBy: 'community',
     palette: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'],
     connectivityEnlargement: 20,
     showNamespaces: false
   });
 
+  // Persistence: Load mappings when filename changes
   useEffect(() => {
-    localStorage.setItem(MAPPINGS_STORAGE_KEY, JSON.stringify(mappings));
-  }, [mappings]);
+    const key = STORAGE_PREFIX + currentFileName;
+    const saved = localStorage.getItem(key);
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved) as AttributeMapping;
+        store.setMappings(parsed);
+      } catch (e) {
+        console.error("Failed to load saved mappings", e);
+      }
+    }
+  }, [currentFileName]);
 
-  // Load and parse initial data
+  // Persistence: Save mappings when they change
+  useEffect(() => {
+    if (!currentFileName || Object.keys(store.mappings).length === 0) return;
+    const key = STORAGE_PREFIX + currentFileName;
+    localStorage.setItem(key, JSON.stringify(store.mappings));
+  }, [store.mappings, currentFileName]);
+
+  // Handle Input Changes
   useEffect(() => {
     const data = parseInputToGraph(input, format);
-    setRawGraphData(data);
+    store.setRawGraphData(data);
+    store.setHiddenNodeIds(new Set()); // Reset hidden on new file
     
-    // Auto-seed for Explore mode: pick the single most connected node
-    if (data.nodes.length > 0) {
-      const degrees = new Map<string, number>();
-      data.links.forEach(l => {
-        const s = typeof l.source === 'string' ? l.source : (l.source as any).id;
-        const t = typeof l.target === 'string' ? l.target : (l.target as any).id;
-        degrees.set(s, (degrees.get(s) || 0) + 1);
-        degrees.set(t, (degrees.get(t) || 0) + 1);
-      });
-
-      let maxDeg = -1;
-      let seed: string | null = null;
-      data.nodes.forEach(n => {
-        const d = degrees.get(n.id) || 0;
-        if (d > maxDeg) {
-          maxDeg = d;
-          seed = n.id;
-        }
-      });
-      if (seed) setExploredNodeIds(new Set([seed]));
+    if (data.nodes.length > 0 && store.viewMode === 'explore') {
+      const seed = data.nodes[0].id;
+      store.setExploredNodeIds(new Set([seed]));
     }
 
     if (data.extraAttributes.length > 0) {
-      const unknownAttributes = data.extraAttributes.filter(attr => !(attr in mappings));
-      if (unknownAttributes.length > 0) {
-        setMappings(prev => {
-          const next = { ...prev };
-          unknownAttributes.forEach(attr => {
+      store.setMappings(prev => {
+        const next = { ...prev };
+        let changed = false;
+        data.extraAttributes.forEach(attr => {
+          if (!(attr in next)) {
             next[attr] = 'None';
-          });
-          return next;
+            changed = true;
+          }
         });
-        setShowMappingModal(true);
-      }
+        return changed ? next : prev;
+      });
     }
   }, [input, format]);
 
-  // Calculate global degrees for consistent node sizing across all modes
-  const globalDegrees = useMemo(() => {
-    const degrees = new Map<string, number>();
-    rawGraphData.nodes.forEach(n => degrees.set(n.id, 0));
-    rawGraphData.links.forEach(l => {
-      const s = typeof l.source === 'string' ? l.source : (l.source as any).id;
-      const t = typeof l.target === 'string' ? l.target : (l.target as any).id;
-      
-      // Determine if inferred based on current mappings
-      let isInferred = l.isInferred ?? false;
-      Object.entries(mappings).forEach(([attr, target]) => {
-        const val = l.metadata?.[attr];
-        if (val !== undefined && target === 'Inferred') {
-          isInferred = !!val;
-        }
+  const handleNodeClick = useCallback((id: string | null, event?: React.MouseEvent) => {
+    if (!id) {
+      store.resetSelection();
+      setAiAnalysis(null);
+      return;
+    }
+
+    const isCtrlPressed = event?.ctrlKey || event?.metaKey;
+    store.setSelectedNodeIds(prev => {
+      const next = new Set(prev);
+      if (isCtrlPressed) {
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+      } else {
+        next.clear();
+        next.add(id);
+      }
+      return next;
+    });
+
+    store.setHighlightedNodeIds(new Set());
+    store.setHighlightedLinkIds(new Set());
+    setSelectedEdge(null);
+    setAiAnalysis(null);
+
+    // Expansion Logic
+    // Standard behavior: clicking a node "expands" it (adds to explored set).
+    // This accumulates nodes in the view. Use 'Reset' (R) to isolate.
+    if (store.viewMode === 'explore' && !isCtrlPressed) {
+      // 1. Add to explored set to ensure it's treated as a seed
+      store.setExploredNodeIds(prev => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
       });
 
-      if (showInferred || !isInferred) {
+      // 2. Identify neighbors and remove them from the 'hidden' set to ensure they appear
+      // This is crucial for the "Expand" behavior if nodes were previously pruned.
+      const neighbors = getNeighbors(id, store.rawGraphData.links);
+      // Also unhide the node itself if it was somehow hidden
+      neighbors.add(id);
+
+      store.setHiddenNodeIds(prev => {
+        if (prev.size === 0) return prev;
+        const next = new Set(prev);
+        let changed = false;
+        neighbors.forEach(nid => {
+          if (next.has(nid)) {
+            next.delete(nid);
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }
+  }, [store]);
+
+  const handleEdgeSelect = useCallback((link: GraphLink | null) => {
+    setSelectedEdge(link);
+    store.setSelectedNodeIds(new Set());
+    store.setHighlightedNodeIds(new Set());
+    store.setHighlightedLinkIds(new Set());
+    setAiAnalysis(null);
+  }, [store]);
+
+  const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    
+    Array.from(files).forEach((file: File) => {
+      const extension = file.name.split('.').pop()?.toLowerCase();
+      if (file.name.endsWith('.mapping')) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            store.setMappings(JSON.parse(e.target?.result as string));
+          } catch (err) { console.error(err); }
+        };
+        reader.readAsText(file);
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const content = e.target?.result as string;
+        if (content) {
+          setFormat((extension === 'json' || extension === 'jsonld') ? 'json' : 'rdf');
+          setCurrentFileName(file.name);
+          setInput(content);
+        }
+      };
+      reader.readAsText(file);
+    });
+  }, [store]);
+
+  // --- Graph Structure Manipulation Actions ---
+
+  const handlePrune = useCallback(() => {
+    const links = store.displayData.links;
+    const nodesToHide = new Set<string>();
+    
+    // Calculate degrees in current visible graph
+    const degrees = new Map<string, number>();
+    links.forEach(l => {
+      const s = typeof l.source === 'object' ? (l.source as GraphNode).id : String(l.source);
+      const t = typeof l.target === 'object' ? (l.target as GraphNode).id : String(l.target);
+      degrees.set(s, (degrees.get(s) || 0) + 1);
+      degrees.set(t, (degrees.get(t) || 0) + 1);
+    });
+
+    // Find neighbors of selected nodes that are leaves (degree 1)
+    store.selectedNodeIds.forEach(sourceId => {
+      const neighbors = getNeighbors(sourceId, links);
+      neighbors.forEach(neighbor => {
+        if (!store.selectedNodeIds.has(neighbor)) {
+          // If neighbor is a leaf in the current view, hide it
+          if ((degrees.get(neighbor) || 0) === 1) {
+            nodesToHide.add(neighbor);
+          }
+        }
+      });
+    });
+
+    if (nodesToHide.size > 0) {
+      store.setHiddenNodeIds(prev => new Set([...prev, ...nodesToHide]));
+    }
+  }, [store]);
+
+  const handleHide = useCallback(() => {
+    const toHide = new Set(store.selectedNodeIds);
+    const links = store.displayData.links;
+    const currentNodes = store.displayData.nodes;
+
+    // Simulate graph state after hiding selected nodes to find orphans
+    const degrees = new Map<string, number>();
+    currentNodes.forEach(n => {
+      if (!toHide.has(n.id)) degrees.set(n.id, 0);
+    });
+
+    links.forEach(l => {
+      const s = typeof l.source === 'object' ? (l.source as GraphNode).id : String(l.source);
+      const t = typeof l.target === 'object' ? (l.target as GraphNode).id : String(l.target);
+      
+      if (!toHide.has(s) && !toHide.has(t)) {
         degrees.set(s, (degrees.get(s) || 0) + 1);
         degrees.set(t, (degrees.get(t) || 0) + 1);
       }
     });
-    return degrees;
-  }, [rawGraphData, mappings, showInferred]);
 
-  const processedGraphData = useMemo(() => {
-    // 1. Prepare base links and identify inferred status
-    const allLinks = rawGraphData.links.map(link => {
-      const sourceId = (typeof link.source === 'object' ? (link.source as GraphNode).id : link.source) as string;
-      const targetId = (typeof link.target === 'object' ? (link.target as GraphNode).id : link.target) as string;
+    // Any remaining node with degree 0 is an orphan and should be hidden
+    degrees.forEach((deg, id) => {
+      if (deg === 0) toHide.add(id);
+    });
+
+    store.setHiddenNodeIds(prev => new Set([...prev, ...toHide]));
+    store.resetSelection();
+  }, [store]);
+
+  const handleReset = useCallback(() => {
+    if (store.selectedNodeIds.size === 0) return;
+
+    if (store.viewMode === 'explore') {
+      // RESET: Isolate view to Selection + Neighbors.
+      // 1. Set explored path strictly to the selection.
+      store.setExploredNodeIds(new Set(store.selectedNodeIds));
       
-      let isInferred = link.isInferred ?? false;
-      Object.entries(mappings).forEach(([attr, target]) => {
-        const val = link.metadata?.[attr];
-        if (val !== undefined && target === 'Inferred') {
-          isInferred = !!val;
-        }
-      });
-
-      return { ...link, sourceId, targetId, isInferred };
-    }).filter(link => showInferred || !link.isInferred);
-
-    // 2. Filter logic for View Modes
-    let visibleNodeIds = new Set<string>();
-    let visibleLinks: any[] = [];
-
-    if (viewMode === 'all') {
-      visibleNodeIds = new Set<string>(rawGraphData.nodes.map(n => n.id));
-      visibleLinks = allLinks;
+      // 2. Clear hidden nodes. This ensures that any neighbor previously pruned or hidden reappears.
+      // Since 'visibleNodeIds' in explore mode is calculated as (Explored + Neighbors) - Hidden,
+      // clearing hidden ensures we see the full neighborhood.
+      store.setHiddenNodeIds(new Set());
     } else {
-      // Explore mode incremental expansion logic
-      const explored = exploredNodeIds;
-      const neighbors = new Set<string>();
-      
-      allLinks.forEach(link => {
-        if (explored.has(link.sourceId)) neighbors.add(link.targetId);
-        if (explored.has(link.targetId)) neighbors.add(link.sourceId);
+      // ALL Mode: Manual isolation.
+      // Keep selected nodes
+      const toKeep = new Set(store.selectedNodeIds);
+      // Keep their neighbors
+      store.selectedNodeIds.forEach(id => {
+        const neighbors = getNeighbors(id, store.rawGraphData.links);
+        neighbors.forEach(n => toKeep.add(n));
       });
 
-      // Nodes are visible if they are explored OR neighbor of an explored node
-      visibleNodeIds = new Set<string>([...Array.from(explored), ...Array.from(neighbors)] as string[]);
-      
-      // Links are visible if they connect to at least one explored node
-      visibleLinks = allLinks.filter(link => 
-        explored.has(link.sourceId) || explored.has(link.targetId)
-      );
+      // Hide everything else
+      const allNodeIds = store.rawGraphData.nodes.map(n => n.id);
+      const newHidden = new Set<string>();
+      allNodeIds.forEach(id => {
+        if (!toKeep.has(id)) newHidden.add(id);
+      });
+      store.setHiddenNodeIds(newHidden);
     }
+  }, [store]);
 
-    // 3. Final graph construction
-    const nodes = rawGraphData.nodes
-      .filter(n => visibleNodeIds.has(n.id))
-      .map(node => {
-        const newNode = { ...node };
-        Object.entries(mappings).forEach(([attr, target]) => {
-          const val = node.metadata?.[attr];
-          if (val !== undefined && target !== 'None') {
-            if (target === 'chunk') newNode.chunk = String(val);
-            if (target === 'Community') newNode.community = String(val);
-          }
-        });
-        return newNode;
-      });
+  // Keyboard Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+      
+      if (store.selectedNodeIds.size > 0) {
+        switch (e.key.toLowerCase()) {
+          case 'p':
+            handlePrune();
+            break;
+          case 'h':
+            handleHide();
+            break;
+          case 'r':
+            handleReset();
+            break;
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [store.selectedNodeIds, handlePrune, handleHide, handleReset]);
 
-    const links = visibleLinks.map(l => ({
-      ...l,
-      source: l.sourceId,
-      target: l.targetId
-    }));
 
-    return { nodes, links, extraAttributes: rawGraphData.extraAttributes };
-  }, [rawGraphData, mappings, showInferred, viewMode, exploredNodeIds]);
+  // --- Graph Algorithms via Service ---
+
+  const handleFindCommonNeighbors = useCallback(() => {
+    const common = findCommonNeighbors(store.selectedNodeIds, store.displayData.links);
+    store.setHighlightedNodeIds(common);
+  }, [store]);
+
+  const handleFindPaths = useCallback(() => {
+    if (store.selectedNodeIds.size !== 2) return;
+    const selectedNodes = Array.from(store.selectedNodeIds);
+    const result = findPaths(selectedNodes[0], selectedNodes[1], store.displayData.links);
+    
+    if (result) {
+      store.setHighlightedNodeIds(result.nodes);
+      store.setHighlightedLinkIds(result.links);
+    }
+  }, [store]);
 
   const handleAiAnalysis = async () => {
-    if (!selectedEdge) return;
+    if (!USE_GEMINI) {
+      setAiAnalysis("Gemini analysis is disabled. Set USE_GEMINI=true to enable.");
+      return;
+    }
     setIsLoadingAi(true);
     setAiAnalysis(null);
     try {
-      const s = typeof selectedEdge.source === 'string' ? selectedEdge.source : (selectedEdge.source as any).label;
-      const t = typeof selectedEdge.target === 'string' ? selectedEdge.target : (selectedEdge.target as any).label;
-      const result = await analyzeRelationship(s, t, selectedEdge.label);
-      setAiAnalysis(result);
+      if (selectedEdge) {
+        const sourceLabel = (typeof selectedEdge.source === 'object' ? (selectedEdge.source as GraphNode).label : String(selectedEdge.source));
+        const targetLabel = (typeof selectedEdge.target === 'object' ? (selectedEdge.target as GraphNode).label : String(selectedEdge.target));
+        const result = await analyzeRelationship(sourceLabel, targetLabel, selectedEdge.label);
+        setAiAnalysis(result || "No analysis available.");
+      } else if (store.selectedNodeIds.size > 0) {
+        const labels = store.displayData.nodes
+          .filter(n => store.selectedNodeIds.has(n.id))
+          .map(n => n.label);
+        const result = await analyzeGroupSemantics(labels);
+        setAiAnalysis(result || "No analysis available.");
+      }
     } catch (err) {
-      setAiAnalysis("Analysis failed.");
+      setAiAnalysis("AI analysis failed. Please check your API key or connection.");
     } finally {
       setIsLoadingAi(false);
     }
   };
 
-  const sanitizeTruncatedContent = (content: string): string => {
-    const trimmed = content.trim();
-    if (trimmed.startsWith('<')) {
-      const lastDescEnd = content.lastIndexOf('</rdf:Description>');
-      if (lastDescEnd !== -1) return content.substring(0, lastDescEnd + 18) + '\n</rdf:RDF>';
-      const lastClosingTag = content.lastIndexOf('</');
-      if (lastClosingTag !== -1) {
-        const nextClosing = content.indexOf('>', lastClosingTag);
-        if (nextClosing !== -1) return content.substring(0, nextClosing + 1) + '\n</rdf:RDF>';
-      }
-      return content + '\n</rdf:RDF>';
-    }
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-      const lastBrace = Math.max(content.lastIndexOf('}'), content.lastIndexOf(']'));
-      if (lastBrace !== -1) return content.substring(0, lastBrace + 1);
-    }
-    const lastDot = content.lastIndexOf('.');
-    if (lastDot !== -1) return content.substring(0, lastDot + 1);
-    return content;
+  const handleForgetNodes = () => {
+    store.setExploredNodeIds(prev => {
+      const next = new Set(prev);
+      store.selectedNodeIds.forEach(id => next.delete(id));
+      return next;
+    });
+    store.resetSelection();
   };
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const limitBytes = maxFileKb * 1024;
-    const reader = new FileReader();
-    const isOverLimit = file.size > limitBytes;
-    const blobToRead = isOverLimit ? file.slice(0, limitBytes + 8192) : file;
-    reader.onload = (e) => {
-      let content = e.target?.result as string;
-      if (content) {
-        if (isOverLimit) content = sanitizeTruncatedContent(content);
-        const extension = file.name.split('.').pop()?.toLowerCase();
-        setFormat(extension === 'json' || extension === 'jsonld' ? 'json' : 'rdf');
-        setInput(content);
-      }
-    };
-    reader.readAsText(blobToRead);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const handleNodeClick = (id: string | null) => {
-    if (!id) {
-      setSelectedNodeId(null);
-      return;
-    }
-    setSelectedNodeId(id);
-    setSelectedEdge(null);
-    setAiAnalysis(null);
-
-    // Expand discovery core in Explore mode
-    if (viewMode === 'explore') {
-      setExploredNodeIds(prev => new Set([...Array.from(prev), id]));
-    }
-  };
-
-  const resetExploration = () => {
-    if (rawGraphData.nodes.length > 0) {
-      // Find top connectivity node again for reset
-      const degrees = globalDegrees;
-      let maxDeg = -1;
-      let seed: string | null = null;
-      rawGraphData.nodes.forEach(n => {
-        const d = degrees.get(n.id) || 0;
-        if (d > maxDeg) {
-          maxDeg = d;
-          seed = n.id;
-        }
-      });
-      if (seed) setExploredNodeIds(new Set([seed]));
-    }
-  };
+  const handleSimStateChange = useCallback((isRunning: boolean, alpha: number) => {
+    setSimState({ isRunning, alpha });
+  }, []);
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-200">
-      <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".rdf,.ttl,.nt,.n3,.owl,.json,.jsonld" />
+      <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".rdf,.ttl,.nt,.n3,.owl,.json,.jsonld,.mapping" multiple />
 
-      {showMappingModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-[480px] p-6 shadow-2xl animate-in zoom-in-95 duration-200">
-            <h2 className="text-xl font-bold mb-2 flex items-center gap-2">
-              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-              Attribute Mapping
-            </h2>
-            <p className="text-sm text-slate-400 mb-6">Map attributes to visualization behaviors:</p>
-            <div className="max-h-[300px] overflow-y-auto space-y-4 pr-2">
-              {rawGraphData.extraAttributes.map(attr => (
-                <div key={attr} className="flex items-center justify-between gap-4 p-3 bg-slate-800/50 rounded-lg border border-slate-700">
-                  <span className="text-sm font-mono text-blue-300 truncate flex-1">{attr}</span>
-                  <select 
-                    value={mappings[attr] || 'None'}
-                    onChange={(e) => setMappings({ ...mappings, [attr]: e.target.value as MappingTarget })}
-                    className="bg-slate-900 text-xs rounded border border-slate-600 px-2 py-1 outline-none"
-                  >
-                    <option value="None">None</option>
-                    <option value="Inferred">Inferred (Edge Style)</option>
-                    <option value="chunk">Chunk (Node Size)</option>
-                    <option value="Community">Community (Color)</option>
-                  </select>
-                </div>
-              ))}
-            </div>
-            <div className="mt-8 flex justify-end">
-              <button onClick={() => setShowMappingModal(false)} className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-bold text-sm transition-all">Done</button>
-            </div>
-          </div>
-        </div>
-      )}
+      <MappingModal 
+        visible={showMappingModal} 
+        rawGraphData={store.rawGraphData} 
+        mappings={store.mappings} 
+        setMappings={store.setMappings} 
+        onClose={() => setShowMappingModal(false)} 
+      />
 
-      <header className="h-14 border-b border-slate-800 bg-slate-900/50 flex items-center justify-between px-6 shrink-0 backdrop-blur-sm z-10">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center font-bold text-lg text-white">G</div>
-          <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">RDF Graph Navigator</h1>
-        </div>
-
-        <div className="flex items-center gap-4">
-          <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 p-1">
-            <select 
-              value={viewMode}
-              onChange={(e) => setViewMode(e.target.value as ViewMode)}
-              className="bg-transparent text-sm font-medium px-2 py-1 outline-none text-slate-200 cursor-pointer"
-            >
-              <option value="all">View: Show All</option>
-              <option value="explore">View: Explore</option>
-            </select>
-            {viewMode === 'explore' && (
-              <button 
-                onClick={resetExploration}
-                className="ml-1 p-1 hover:bg-slate-700 rounded transition-colors text-slate-400"
-                title="Reset Exploration"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-              </button>
-            )}
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">Load File</button>
-            <button onClick={() => setInput(sampleRDF)} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-md text-sm border border-slate-700">Sample RDF</button>
-            <button onClick={() => setInput(sampleJSON)} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-md text-sm border border-slate-700">Sample JSON</button>
-          </div>
-        </div>
-      </header>
+      <Header 
+        currentFileName={currentFileName}
+        viewMode={store.viewMode}
+        setViewMode={store.setViewMode}
+        onLoadClick={() => fileInputRef.current?.click()}
+      />
 
       <main className="flex flex-1 overflow-hidden relative">
-        <aside className="w-80 border-r border-slate-800 bg-slate-900/80 p-4 flex flex-col gap-6 overflow-y-auto z-10">
-          <section>
-            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Input Data</h2>
-            <div className="mb-4 space-y-2">
-              <div className="flex justify-between text-[10px] text-slate-400 uppercase font-bold">
-                <span>Max Load Size</span>
-                <span className="text-blue-400">{maxFileKb >= 1000 ? `${(maxFileKb / 1000).toFixed(1)} MB` : `${maxFileKb} KB`}</span>
-              </div>
-              <input type="range" min="0" max="100" value={valueToLog(maxFileKb)} onChange={(e) => setMaxFileKb(logToValue(Number(e.target.value)))} className="w-full h-1 bg-slate-800 accent-blue-600 rounded-lg cursor-pointer" />
-            </div>
-            <textarea value={input} onChange={(e) => setInput(e.target.value)} className="w-full h-32 bg-slate-800 border border-slate-700 rounded p-2 text-xs font-mono text-blue-300 focus:outline-none resize-none" />
-          </section>
-
-          <section>
-            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-4">Physics</h2>
-            <div className="space-y-4">
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs"><span>Charge</span><span className="text-blue-400">{physics.charge}</span></div>
-                <input type="range" min="-1000" max="0" value={physics.charge} onChange={(e) => setPhysics({ ...physics, charge: Number(e.target.value) })} className="w-full accent-blue-500" />
-              </div>
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs"><span>Link Distance</span><span className="text-blue-400">{physics.linkDistance}px</span></div>
-                <input type="range" min="20" max="300" value={physics.linkDistance} onChange={(e) => setPhysics({ ...physics, linkDistance: Number(e.target.value) })} className="w-full accent-blue-500" />
-              </div>
-            </div>
-          </section>
-
-          <section>
-            <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Visualization</h2>
-            <div className="space-y-4">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={grouping.byType} onChange={(e) => setGrouping({ ...grouping, byType: e.target.checked })} className="w-4 h-4 accent-blue-500" />
-                <span className="text-sm text-slate-300">Group by Community</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={showInferred} onChange={(e) => setShowInferred(e.target.checked)} className="w-4 h-4 accent-blue-500" />
-                <span className="text-sm text-slate-300">Show Inferred Edges</span>
-              </label>
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs"><span>Hub Scaling</span><span className="text-blue-400">{grouping.connectivityEnlargement}%</span></div>
-                <input type="range" min="0" max="100" value={grouping.connectivityEnlargement} onChange={(e) => setGrouping({ ...grouping, connectivityEnlargement: Number(e.target.value) })} className="w-full accent-blue-500" />
-              </div>
-            </div>
-          </section>
-        </aside>
+        <Sidebar 
+          physics={physics} 
+          setPhysics={setPhysics} 
+          grouping={grouping} 
+          setGrouping={setGrouping} 
+          simState={simState} 
+          store={store} 
+          memStatus={memStatus}
+          onConfigureMappings={() => setShowMappingModal(true)}
+        />
 
         <section className="flex-1 relative bg-slate-900">
           <GraphView 
-            data={processedGraphData}
+            data={store.displayData}
             physics={physics}
             edgeConfig={edgeConfig}
             grouping={grouping}
-            selectedNodeId={selectedNodeId}
+            selectedNodeIds={store.selectedNodeIds}
+            highlightedNodeIds={store.highlightedNodeIds}
+            highlightedLinkIds={store.highlightedLinkIds}
             onNodeSelect={handleNodeClick}
-            onEdgeSelect={(link) => { setSelectedEdge(link); setSelectedNodeId(null); }}
-            globalDegrees={globalDegrees}
+            onEdgeSelect={handleEdgeSelect}
+            onSimulationStateChange={handleSimStateChange}
+            globalDegrees={store.globalDegrees}
           />
 
-          <div className="absolute bottom-6 left-6 bg-slate-900/60 backdrop-blur-md p-2 rounded text-[10px] text-slate-400 flex items-center gap-2 pointer-events-none uppercase tracking-tighter">
-            <span className="font-bold text-slate-500">Mode:</span>
-            <span>{viewMode === 'all' ? 'All Data Visible' : 'Explore (Click nodes to reveal neighbors)'}</span>
-          </div>
-
-          {(selectedNodeId || selectedEdge) && (
-            <div className="absolute right-6 top-6 w-80 bg-slate-900/95 border border-slate-700 rounded-xl p-5 shadow-2xl backdrop-blur-md z-30 animate-in fade-in slide-in-from-right-4">
-              {selectedNodeId ? (
-                <div>
-                  <h3 className="text-blue-400 text-xs font-bold uppercase mb-1">Node Info</h3>
-                  <p className="text-lg font-bold text-white break-all">{processedGraphData.nodes.find(n => n.id === selectedNodeId)?.label}</p>
-                  <p className="text-[10px] text-slate-500 font-mono mt-1 break-all">{selectedNodeId}</p>
-                </div>
-              ) : selectedEdge ? (
-                <div className="space-y-4">
-                  <div>
-                    <h3 className="text-blue-400 text-xs font-bold uppercase mb-1">Relationship</h3>
-                    <p className="text-sm font-bold">{selectedEdge.label}</p>
-                  </div>
-                  <button onClick={handleAiAnalysis} disabled={isLoadingAi} className="w-full py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-bold text-white transition-colors">
-                    {isLoadingAi ? 'Analyzing...' : 'Semantic Analysis'}
-                  </button>
-                  {aiAnalysis && <div className="bg-slate-800 rounded-lg p-3 text-xs text-slate-300 border-l-4 border-l-blue-500 leading-relaxed">{aiAnalysis}</div>}
-                </div>
-              ) : null}
-              <button onClick={() => { setSelectedNodeId(null); setSelectedEdge(null); }} className="absolute top-3 right-3 text-slate-500 hover:text-white">
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-              </button>
-            </div>
-          )}
+          <SelectionPanel 
+            selectedNodeIds={store.selectedNodeIds}
+            selectedEdge={selectedEdge}
+            aiAnalysis={aiAnalysis}
+            isLoadingAi={isLoadingAi}
+            viewMode={store.viewMode}
+            useGemini={USE_GEMINI}
+            onAnalyze={handleAiAnalysis}
+            onCommonNeighbors={handleFindCommonNeighbors}
+            onFindPaths={handleFindPaths}
+            onForgetNodes={handleForgetNodes}
+            onDismiss={() => { store.resetSelection(); setAiAnalysis(null); }}
+            onPrune={handlePrune}
+            onHide={handleHide}
+            onReset={handleReset}
+          />
         </section>
       </main>
-
-      <footer className="h-8 border-t border-slate-800 bg-slate-900 flex items-center justify-between px-6 text-[10px] text-slate-500">
-        <div className="flex gap-4">
-          <span>Nodes: {processedGraphData.nodes.length} / {rawGraphData.nodes.length}</span>
-          <span>Edges: {processedGraphData.links.length} / {rawGraphData.links.length}</span>
-        </div>
-        <div>Dynamic Discovery Mode • RDF Navigator</div>
-      </footer>
     </div>
   );
 };
