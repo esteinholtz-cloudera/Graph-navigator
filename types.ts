@@ -63,10 +63,13 @@ export interface PhysicsConfig {
   friction: number; // velocityDecay
   gravity: number;  // centering force strength
   dimmingOpacity: number; // For non-highlighted parts
+  autoFreeze: boolean; // Stop simulation when alpha is low
+  isPhysicsEnabled: boolean; // Manual kill switch
+  stabilizationThreshold: number; // Alpha value at which to stop
 }
 
 export interface GroupingConfig {
-  byType: boolean;
+  groupBy: 'type' | 'community' | 'none';
   palette: string[];
   connectivityEnlargement: number;
   showNamespaces: boolean;
