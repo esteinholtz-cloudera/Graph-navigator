@@ -26,6 +26,8 @@ const App: React.FC = () => {
   const [showMappingModal, setShowMappingModal] = useState(false);
   const [memStatus, setMemStatus] = useState<MemoryStatus | null>(null);
   const [simState, setSimState] = useState({ isRunning: false, alpha: 0 });
+  const [isLoadingFile, setIsLoadingFile] = useState(false);
+  const [fileLoadError, setFileLoadError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -34,6 +36,43 @@ const App: React.FC = () => {
     const interval = setInterval(() => setMemStatus(getMemoryStatus()), 2000);
     return () => clearInterval(interval);
   }, []);
+
+  // Load file from URL parameter
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const filePath = params.get('file');
+    
+    if (filePath) {
+      loadFileFromServer(filePath);
+    }
+  }, []);
+
+  const loadFileFromServer = async (path: string) => {
+    setIsLoadingFile(true);
+    setFileLoadError(null);
+    
+    try {
+      const response = await fetch(path);
+      if (!response.ok) {
+        throw new Error(`Failed to load file: ${response.status} ${response.statusText}`);
+      }
+      
+      const content = await response.text();
+      const fileName = path.split('/').pop() || 'file';
+      const extension = fileName.split('.').pop()?.toLowerCase();
+      
+      setFormat((extension === 'json' || extension === 'jsonld') ? 'json' : 'rdf');
+      setCurrentFileName(fileName);
+      setInput(content);
+      setFileLoadError(null);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error loading file';
+      setFileLoadError(errorMsg);
+      console.error('Error loading file from URL:', error);
+    } finally {
+      setIsLoadingFile(false);
+    }
+  };
 
   const [physics, setPhysics] = useState<PhysicsConfig>({
     charge: -300,
@@ -385,6 +424,42 @@ const App: React.FC = () => {
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-200">
       <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".rdf,.ttl,.nt,.n3,.owl,.json,.jsonld,.mapping" multiple />
+
+      {/* Loading overlay */}
+      {isLoadingFile && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl p-8 shadow-2xl flex flex-col items-center gap-4">
+            <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+            <div className="text-lg font-medium text-slate-200">Loading file...</div>
+            <div className="text-sm text-slate-400">Please wait</div>
+          </div>
+        </div>
+      )}
+
+      {/* Error notification */}
+      {fileLoadError && (
+        <div className="fixed top-20 left-1/2 transform -translate-x-1/2 z-50 max-w-md">
+          <div className="bg-red-900/20 border border-red-600/40 rounded-lg p-4 shadow-2xl backdrop-blur-md">
+            <div className="flex items-start gap-3">
+              <svg className="w-6 h-6 text-red-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <div className="flex-1">
+                <h3 className="text-red-400 font-bold text-sm mb-1">Failed to Load File</h3>
+                <p className="text-red-200 text-sm">{fileLoadError}</p>
+              </div>
+              <button 
+                onClick={() => setFileLoadError(null)}
+                className="text-red-400 hover:text-red-300 flex-shrink-0"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <MappingModal 
         visible={showMappingModal} 

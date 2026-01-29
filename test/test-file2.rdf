@@ -1,0 +1,2 @@
+@prefix : <http://test.org/> .
+:TestNode :hasValue "different file" .

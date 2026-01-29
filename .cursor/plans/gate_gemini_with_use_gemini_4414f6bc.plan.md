@@ -169,18 +169,15 @@ const SelectionPanel: React.FC<SelectionPanelProps> = ({
 ## Testing
 
 1. **Test with Gemini disabled (default):**
-
-   - Ensure `USE_GEMINI` is not set in `.env.local`
-   - Start dev server: `npm run dev`
-   - Verify "Analyze with Gemini" button does not appear in SelectionPanel
-   - Application should function normally for all non-Gemini features
-
+  - Ensure `USE_GEMINI` is not set in `.env.local`
+  - Start dev server: `npm run dev`
+  - Verify "Analyze with Gemini" button does not appear in SelectionPanel
+  - Application should function normally for all non-Gemini features
 2. **Test with Gemini enabled:**
-
-   - Add `USE_GEMINI=true` to `.env.local`
-   - Restart dev server
-   - Verify "Analyze with Gemini" button appears in SelectionPanel
-   - Click button and verify API calls work correctly
+  - Add `USE_GEMINI=true` to `.env.local`
+  - Restart dev server
+  - Verify "Analyze with Gemini" button appears in SelectionPanel
+  - Click button and verify API calls work correctly
 
 ## Files Modified
 
@@ -192,11 +189,10 @@ const SelectionPanel: React.FC<SelectionPanelProps> = ({
 ## Notes
 
 - The implementation uses a three-layer defense:
-
   1. **UI Layer**: Button hidden when disabled
   2. **Application Layer**: Handler returns early when disabled
   3. **Service Layer**: Functions return early when disabled (defensive)
-
 - This ensures Gemini functionality is completely disabled when `USE_GEMINI` is not set
 - No breaking changes - existing functionality preserved when enabled
 - Environment variable must be set to the string `'true'` (case-sensitive)
+

@@ -1,0 +1,22 @@
+@prefix : <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+:Alice a :Person ;
+    rdfs:label "Alice" ;
+    :knows :Bob ;
+    :age "30" .
+
+:Bob a :Person ;
+    rdfs:label "Bob" ;
+    :knows :Charlie ;
+    :age "25" .
+
+:Charlie a :Person ;
+    rdfs:label "Charlie" ;
+    :worksAt :Company1 ;
+    :age "35" .
+
+:Company1 a :Organization ;
+    rdfs:label "Tech Corp" ;
+    :location "San Francisco" .
