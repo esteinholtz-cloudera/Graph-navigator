@@ -4,6 +4,7 @@ import * as d3 from 'd3';
 import { PhysicsConfig, GroupingConfig } from '../types';
 import { GraphStore } from '../hooks/useGraphStore';
 import { MemoryStatus, formatBytes } from '../services/memoryMonitor';
+import { PHYSICS_PRESETS, detectOptimalPreset } from '../configs/physicsPresets';
 
 interface SidebarProps {
   physics: PhysicsConfig;
@@ -19,6 +20,14 @@ interface SidebarProps {
 const Sidebar: React.FC<SidebarProps> = ({
   physics, setPhysics, grouping, setGrouping, simState, store, memStatus, onConfigureMappings
 }) => {
+  
+  // Detect optimal preset
+  const recommendedPreset = useMemo(() => {
+    return detectOptimalPreset(
+      store.displayData.nodes.length,
+      store.displayData.links.length
+    );
+  }, [store.displayData.nodes.length, store.displayData.links.length]);
   
   // Legend Calculations
   const legendTitle = useMemo(() => {
@@ -52,6 +61,25 @@ const Sidebar: React.FC<SidebarProps> = ({
         </div>
         
         <div className="bg-slate-800/50 rounded p-3 space-y-3">
+          <div className="space-y-2">
+            <span className="text-[10px] text-slate-500 uppercase">Preset</span>
+            <select 
+              onChange={(e) => setPhysics(PHYSICS_PRESETS[e.target.value].config)}
+              className="w-full bg-slate-800 text-xs px-3 py-2 rounded border border-slate-700"
+            >
+              {Object.entries(PHYSICS_PRESETS).map(([key, preset]) => (
+                <option key={key} value={key}>
+                  {preset.name} {key === recommendedPreset && '⭐'}
+                </option>
+              ))}
+            </select>
+            {recommendedPreset && (
+              <p className="text-[9px] text-slate-500 italic">
+                ⭐ = Recommended for current graph
+              </p>
+            )}
+          </div>
+          
           <div className="flex justify-between items-center">
             <span className="text-xs">Enabled</span>
             <button 

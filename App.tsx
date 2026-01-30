@@ -9,14 +9,20 @@ import { PhysicsConfig, GroupingConfig, GraphLink, MappingTarget, GraphNode, Edg
 import { parseInputToGraph, sampleRDF } from './services/rdfParser';
 import { analyzeRelationship, analyzeGroupSemantics } from './services/geminiService';
 import { useGraphStore } from './hooks/useGraphStore';
+import { useFileLoader } from './hooks/useFileLoader';
+import { useGraphActions } from './hooks/useGraphActions';
 import { getMemoryStatus, MemoryStatus } from './services/memoryMonitor';
-import { findCommonNeighbors, findPaths, getNeighbors } from './services/graphAlgorithms';
+import { findCommonNeighbors, findPaths } from './services/graphAlgorithms';
+import { PHYSICS_PRESETS } from './configs/physicsPresets';
 
 const STORAGE_PREFIX = 'rdf_nav_mappings_';
 const USE_GEMINI = process.env.USE_GEMINI === 'true';
 
 const App: React.FC = () => {
   const store = useGraphStore();
+  const fileLoader = useFileLoader();
+  const graphActions = useGraphActions(store);
+  
   const [input, setInput] = useState(sampleRDF);
   const [format, setFormat] = useState<'rdf' | 'json'>('rdf');
   const [currentFileName, setCurrentFileName] = useState<string>('sample.rdf');
@@ -26,8 +32,6 @@ const App: React.FC = () => {
   const [showMappingModal, setShowMappingModal] = useState(false);
   const [memStatus, setMemStatus] = useState<MemoryStatus | null>(null);
   const [simState, setSimState] = useState({ isRunning: false, alpha: 0 });
-  const [isLoadingFile, setIsLoadingFile] = useState(false);
-  const [fileLoadError, setFileLoadError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -43,51 +47,17 @@ const App: React.FC = () => {
     const filePath = params.get('file');
     
     if (filePath) {
-      loadFileFromServer(filePath);
+      fileLoader.loadFromServer(filePath).then(result => {
+        if (result) {
+          setFormat(result.format);
+          setCurrentFileName(result.fileName);
+          setInput(result.content);
+        }
+      });
     }
   }, []);
 
-  const loadFileFromServer = async (path: string) => {
-    setIsLoadingFile(true);
-    setFileLoadError(null);
-    
-    try {
-      const response = await fetch(path);
-      if (!response.ok) {
-        throw new Error(`Failed to load file: ${response.status} ${response.statusText}`);
-      }
-      
-      const content = await response.text();
-      const fileName = path.split('/').pop() || 'file';
-      const extension = fileName.split('.').pop()?.toLowerCase();
-      
-      setFormat((extension === 'json' || extension === 'jsonld') ? 'json' : 'rdf');
-      setCurrentFileName(fileName);
-      setInput(content);
-      setFileLoadError(null);
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : 'Unknown error loading file';
-      setFileLoadError(errorMsg);
-      console.error('Error loading file from URL:', error);
-    } finally {
-      setIsLoadingFile(false);
-    }
-  };
-
-  const [physics, setPhysics] = useState<PhysicsConfig>({
-    charge: -300,
-    linkDistance: 120,
-    collisionRadius: 40,
-    centering: true,
-    disentangleFactor: 0.5,
-    enableDisentangle: true,
-    friction: 0.4,
-    gravity: 0.1,
-    dimmingOpacity: 0.7,
-    autoFreeze: true,
-    isPhysicsEnabled: true,
-    stabilizationThreshold: 0.01
-  });
+  const [physics, setPhysics] = useState<PhysicsConfig>(PHYSICS_PRESETS.balanced.config);
 
   const edgeConfig = useMemo<EdgeConfig>(() => ({
     explicit: { color: '#475569', width: 2, opacity: 0.6, arrowSize: 6 },
@@ -173,37 +143,11 @@ const App: React.FC = () => {
     setSelectedEdge(null);
     setAiAnalysis(null);
 
-    // Expansion Logic
-    // Standard behavior: clicking a node "expands" it (adds to explored set).
-    // This accumulates nodes in the view. Use 'Reset' (R) to isolate.
+    // Expansion Logic - use extracted action
     if (store.viewMode === 'explore' && !isCtrlPressed) {
-      // 1. Add to explored set to ensure it's treated as a seed
-      store.setExploredNodeIds(prev => {
-        const next = new Set(prev);
-        next.add(id);
-        return next;
-      });
-
-      // 2. Identify neighbors and remove them from the 'hidden' set to ensure they appear
-      // This is crucial for the "Expand" behavior if nodes were previously pruned.
-      const neighbors = getNeighbors(id, store.rawGraphData.links);
-      // Also unhide the node itself if it was somehow hidden
-      neighbors.add(id);
-
-      store.setHiddenNodeIds(prev => {
-        if (prev.size === 0) return prev;
-        const next = new Set(prev);
-        let changed = false;
-        neighbors.forEach(nid => {
-          if (next.has(nid)) {
-            next.delete(nid);
-            changed = true;
-          }
-        });
-        return changed ? next : prev;
-      });
+      graphActions.expand(id);
     }
-  }, [store]);
+  }, [store, graphActions]);
 
   const handleEdgeSelect = useCallback((link: GraphLink | null) => {
     setSelectedEdge(link);
@@ -213,12 +157,11 @@ const App: React.FC = () => {
     setAiAnalysis(null);
   }, [store]);
 
-  const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
     
-    Array.from(files).forEach((file: File) => {
-      const extension = file.name.split('.').pop()?.toLowerCase();
+    for (const file of Array.from(files)) {
       if (file.name.endsWith('.mapping')) {
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -227,116 +170,21 @@ const App: React.FC = () => {
           } catch (err) { console.error(err); }
         };
         reader.readAsText(file);
-        return;
+        continue;
       }
 
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const content = e.target?.result as string;
-        if (content) {
-          setFormat((extension === 'json' || extension === 'jsonld') ? 'json' : 'rdf');
-          setCurrentFileName(file.name);
-          setInput(content);
-        }
-      };
-      reader.readAsText(file);
-    });
-  }, [store]);
-
-  // --- Graph Structure Manipulation Actions ---
-
-  const handlePrune = useCallback(() => {
-    const links = store.displayData.links;
-    const nodesToHide = new Set<string>();
-    
-    // Calculate degrees in current visible graph
-    const degrees = new Map<string, number>();
-    links.forEach(l => {
-      const s = typeof l.source === 'object' ? (l.source as GraphNode).id : String(l.source);
-      const t = typeof l.target === 'object' ? (l.target as GraphNode).id : String(l.target);
-      degrees.set(s, (degrees.get(s) || 0) + 1);
-      degrees.set(t, (degrees.get(t) || 0) + 1);
-    });
-
-    // Find neighbors of selected nodes that are leaves (degree 1)
-    store.selectedNodeIds.forEach(sourceId => {
-      const neighbors = getNeighbors(sourceId, links);
-      neighbors.forEach(neighbor => {
-        if (!store.selectedNodeIds.has(neighbor)) {
-          // If neighbor is a leaf in the current view, hide it
-          if ((degrees.get(neighbor) || 0) === 1) {
-            nodesToHide.add(neighbor);
-          }
-        }
-      });
-    });
-
-    if (nodesToHide.size > 0) {
-      store.setHiddenNodeIds(prev => new Set([...prev, ...nodesToHide]));
-    }
-  }, [store]);
-
-  const handleHide = useCallback(() => {
-    const toHide = new Set(store.selectedNodeIds);
-    const links = store.displayData.links;
-    const currentNodes = store.displayData.nodes;
-
-    // Simulate graph state after hiding selected nodes to find orphans
-    const degrees = new Map<string, number>();
-    currentNodes.forEach(n => {
-      if (!toHide.has(n.id)) degrees.set(n.id, 0);
-    });
-
-    links.forEach(l => {
-      const s = typeof l.source === 'object' ? (l.source as GraphNode).id : String(l.source);
-      const t = typeof l.target === 'object' ? (l.target as GraphNode).id : String(l.target);
-      
-      if (!toHide.has(s) && !toHide.has(t)) {
-        degrees.set(s, (degrees.get(s) || 0) + 1);
-        degrees.set(t, (degrees.get(t) || 0) + 1);
+      try {
+        const result = await fileLoader.loadFromFile(file);
+        setFormat(result.format);
+        setCurrentFileName(result.fileName);
+        setInput(result.content);
+      } catch (err) {
+        console.error('Error loading file:', err);
       }
-    });
-
-    // Any remaining node with degree 0 is an orphan and should be hidden
-    degrees.forEach((deg, id) => {
-      if (deg === 0) toHide.add(id);
-    });
-
-    store.setHiddenNodeIds(prev => new Set([...prev, ...toHide]));
-    store.resetSelection();
-  }, [store]);
-
-  const handleReset = useCallback(() => {
-    if (store.selectedNodeIds.size === 0) return;
-
-    if (store.viewMode === 'explore') {
-      // RESET: Isolate view to Selection + Neighbors.
-      // 1. Set explored path strictly to the selection.
-      store.setExploredNodeIds(new Set(store.selectedNodeIds));
-      
-      // 2. Clear hidden nodes. This ensures that any neighbor previously pruned or hidden reappears.
-      // Since 'visibleNodeIds' in explore mode is calculated as (Explored + Neighbors) - Hidden,
-      // clearing hidden ensures we see the full neighborhood.
-      store.setHiddenNodeIds(new Set());
-    } else {
-      // ALL Mode: Manual isolation.
-      // Keep selected nodes
-      const toKeep = new Set(store.selectedNodeIds);
-      // Keep their neighbors
-      store.selectedNodeIds.forEach(id => {
-        const neighbors = getNeighbors(id, store.rawGraphData.links);
-        neighbors.forEach(n => toKeep.add(n));
-      });
-
-      // Hide everything else
-      const allNodeIds = store.rawGraphData.nodes.map(n => n.id);
-      const newHidden = new Set<string>();
-      allNodeIds.forEach(id => {
-        if (!toKeep.has(id)) newHidden.add(id);
-      });
-      store.setHiddenNodeIds(newHidden);
     }
-  }, [store]);
+  }, [store, fileLoader]);
+
+  // --- Graph Structure Manipulation Actions (extracted to custom hook) ---
 
   // Keyboard Shortcuts
   useEffect(() => {
@@ -347,20 +195,20 @@ const App: React.FC = () => {
       if (store.selectedNodeIds.size > 0) {
         switch (e.key.toLowerCase()) {
           case 'p':
-            handlePrune();
+            graphActions.prune();
             break;
           case 'h':
-            handleHide();
+            graphActions.hide();
             break;
           case 'r':
-            handleReset();
+            graphActions.reset();
             break;
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [store.selectedNodeIds, handlePrune, handleHide, handleReset]);
+  }, [store.selectedNodeIds, graphActions]);
 
 
   // --- Graph Algorithms via Service ---
@@ -408,14 +256,6 @@ const App: React.FC = () => {
     }
   };
 
-  const handleForgetNodes = () => {
-    store.setExploredNodeIds(prev => {
-      const next = new Set(prev);
-      store.selectedNodeIds.forEach(id => next.delete(id));
-      return next;
-    });
-    store.resetSelection();
-  };
 
   const handleSimStateChange = useCallback((isRunning: boolean, alpha: number) => {
     setSimState({ isRunning, alpha });
@@ -426,7 +266,7 @@ const App: React.FC = () => {
       <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".rdf,.ttl,.nt,.n3,.owl,.json,.jsonld,.mapping" multiple />
 
       {/* Loading overlay */}
-      {isLoadingFile && (
+      {fileLoader.isLoading && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center">
           <div className="bg-slate-900 border border-slate-700 rounded-xl p-8 shadow-2xl flex flex-col items-center gap-4">
             <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
@@ -437,7 +277,7 @@ const App: React.FC = () => {
       )}
 
       {/* Error notification */}
-      {fileLoadError && (
+      {fileLoader.error && (
         <div className="fixed top-20 left-1/2 transform -translate-x-1/2 z-50 max-w-md">
           <div className="bg-red-900/20 border border-red-600/40 rounded-lg p-4 shadow-2xl backdrop-blur-md">
             <div className="flex items-start gap-3">
@@ -446,10 +286,10 @@ const App: React.FC = () => {
               </svg>
               <div className="flex-1">
                 <h3 className="text-red-400 font-bold text-sm mb-1">Failed to Load File</h3>
-                <p className="text-red-200 text-sm">{fileLoadError}</p>
+                <p className="text-red-200 text-sm">{fileLoader.error}</p>
               </div>
               <button 
-                onClick={() => setFileLoadError(null)}
+                onClick={fileLoader.clearError}
                 className="text-red-400 hover:text-red-300 flex-shrink-0"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -513,11 +353,11 @@ const App: React.FC = () => {
             onAnalyze={handleAiAnalysis}
             onCommonNeighbors={handleFindCommonNeighbors}
             onFindPaths={handleFindPaths}
-            onForgetNodes={handleForgetNodes}
+            onForgetNodes={graphActions.forgetNodes}
             onDismiss={() => { store.resetSelection(); setAiAnalysis(null); }}
-            onPrune={handlePrune}
-            onHide={handleHide}
-            onReset={handleReset}
+            onPrune={graphActions.prune}
+            onHide={graphActions.hide}
+            onReset={graphActions.reset}
           />
         </section>
       </main>
